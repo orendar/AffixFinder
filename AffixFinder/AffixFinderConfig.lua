@@ -122,7 +122,7 @@ SetRegionText(autoWarp:GetName(), "Text", "T3 map-warp assist from the Mobs view
 autoWarp.tooltipText = "Mob rows always mark the latest clicked target on the map. "
     .. "When enabled, AffixFinder also opens that zone's map so you can click the target to warp -- "
     .. "but only when a warp is usable: it skips dungeons/raids and opens only for zones you actually "
-    .. "have the t3 warp for. Safe to leave on with a partial set of warps. Disabled by default."
+    .. "have the t3 warp for. Safe to leave on with a partial set of warps. Enabled by default."
 autoWarp:SetScript("OnClick", function(self)
     SaveConfig("automaticWarp", self:GetChecked() and true or false)
 end)

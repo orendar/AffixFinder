@@ -9,7 +9,7 @@ It ranks:
 - specific resistance farms, such as fire or frost resistance
 - account-wide class opportunities
 
-AffixFinder only counts items that drop from killable mobs. Vendor, quest, crafting, and container-only items are not included.
+AffixFinder only counts items that drop from killable mobs. Vendor, quest, crafting, container-only items, and melee weapons are not included. On Synastria, melee-weapon affixes do not affect attuned stats; ranged weapons, wands, and shields still count normally.
 
 > Requires Synastria/WoWExt. The addon will load on other clients, but it only produces useful results on Synastria.
 
@@ -61,7 +61,7 @@ Clicking a mob row marks that mob on the map. Questie is optional; without it, A
 Useful settings include:
 
 - include or exclude mythic items
-- enable T3 map-warp assist from mob/resist rows
+- configure T3 map-warp assist from mob/resist rows
 - choose the auto-rescan interval
 - set the default minimum mob spawn count
 
@@ -72,6 +72,7 @@ AffixFinder does not save the full item graph or ranking results. It only persis
 - Scope can be **Character** or **Account**.
 - Forge filters are thresholds: `tf` includes TF/WF/LF, `wf` includes WF/LF, and `lf` means LF only.
 - Bind filters can include BoP, BoE, or both.
+- Melee weapons are ignored because their random affixes do not contribute attuned stats on Synastria. Ranged weapons, wands, and shields are still counted.
 - Resistance values are estimates based on item level, because the exact rolled suffix value is not available during scans.
 - Diagnostic commands such as `/af debug`, `/af zonedbg`, and `/af warp` are available if you want to inspect what the addon is reading.
 

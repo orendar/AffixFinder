@@ -37,13 +37,13 @@ AF.resistIndexByElement = nil
 --                    detected change, the original behaviour).
 --   minSpawns      : default minimum reported mob spawn count for the Mobs view.
 --   includeMythics : whether mythic items count toward the affix calculations.
---   automaticWarp  : opt-in t3 map-opening helper from the Mobs view. Disabled
---                    by default; mob clicks still place the latest-target pin.
+--   automaticWarp  : T3-gated map-opening helper from the Mobs view. Enabled by
+--                    default; mob clicks still place the latest-target pin.
 AF.configDefaults = {
     rescanInterval = 60,
     minSpawns = 5,
     includeMythics = false,
-    automaticWarp = false,
+    automaticWarp = true,
 }
 AF.config = {}
 for k, v in pairs(AF.configDefaults) do
@@ -414,6 +414,27 @@ local function weaponKey(s, equipLoc)
     if string.find(s, "mace") then return twoHand and "mace2h" or "mace1h" end
     if string.find(s, "sword") then return twoHand and "sword2h" or "sword1h" end
     return nil
+end
+
+local COUNTED_WEAPON_AFFIX_KEYS = {
+    bow = true,
+    crossbow = true,
+    gun = true,
+    thrown = true,
+    wand = true,
+}
+
+-- Synastria melee weapons attune a fixed weapon-stat amount; their random
+-- affixes do not contribute attuned stats. Count ranged weapons and wands, but
+-- drop melee weapons everywhere affix value is computed.
+local function isIgnoredMeleeWeapon(itemType, itemSubType, itemEquipLoc)
+    local typeText = string.lower(tostring(itemType or ""))
+    local weaponConstant = _G and _G.WEAPON
+    if not (typeText == "weapon" or (weaponConstant ~= nil and itemType == weaponConstant)) then
+        return false
+    end
+    local key = weaponKey(string.lower(itemSubType or ""), itemEquipLoc)
+    return not (key and COUNTED_WEAPON_AFFIX_KEYS[key])
 end
 
 -- Returns a shared set { [classToken] = true } of the classes a WotLK item is
@@ -1360,22 +1381,25 @@ local function affixedItemValue(itemId, scope, forgeFilter, bindFilter, includeM
     if not includeMythics and itemIsMythic(itemId) then
         return nil
     end
-    -- No itemHasRandomAffix gate here: this is only ever called over
-    -- AF.affixedItemIds (every id is already known affixed), and getAffixCounts
-    -- below returns possible <= 0 for anything without a usable affix mask.
-    local possible, left = getAffixCounts(itemId, forgeFilter)
-    if possible <= 0 then
-        return nil
-    end
-
-    -- One GetItemInfoCustom call feeds both the display category and (account
-    -- scope only) the per-class attribution.
+    -- One GetItemInfoCustom call feeds the melee-weapon exclusion, display
+    -- category, and (account scope only) per-class attribution.
     local reqLevel, itemType, itemSubType, itemEquipLoc
     if type(GetItemInfoCustom) == "function" then
         local ok, _, _, _, _, rl, it, ist, _, eq = safeCall(GetItemInfoCustom, itemId)
         if ok then
             reqLevel, itemType, itemSubType, itemEquipLoc = rl, it, ist, eq
         end
+    end
+    if isIgnoredMeleeWeapon(itemType, itemSubType, itemEquipLoc) then
+        return nil
+    end
+
+    -- No itemHasRandomAffix gate here: this is only ever called over
+    -- AF.affixedItemIds (every id is already known affixed), and getAffixCounts
+    -- below returns possible <= 0 for anything without a usable affix mask.
+    local possible, left = getAffixCounts(itemId, forgeFilter)
+    if possible <= 0 then
+        return nil
     end
 
     return {
@@ -1534,6 +1558,12 @@ local function affixedResistValue(itemId, scope, elementIndex, includeMythics)
     -- behaviour should match the rest of the addon rather than silently differ.)
     if not includeMythics and itemIsMythic(itemId) then
         return nil
+    end
+    if type(GetItemInfoCustom) == "function" then
+        local ok, _, _, _, _, _, itemType, itemSubType, _, itemEquipLoc = safeCall(GetItemInfoCustom, itemId)
+        if ok and isIgnoredMeleeWeapon(itemType, itemSubType, itemEquipLoc) then
+            return nil
+        end
     end
     local tok, _, tags2 = safeCall(GetItemTagsCustom, itemId)
     if not tok or bitAnd(tags2 or 0, 0x2) == 0 then
@@ -2834,6 +2864,267 @@ local function printZoneClassification(options)
     end)
 end
 
+local function listClasses(classes)
+    if not classes then
+        return "-"
+    end
+    local parts = {}
+    for _, token in ipairs(AF.CLASS_ORDER) do
+        if classes[token] then
+            parts[#parts + 1] = token
+        end
+    end
+    return (#parts > 0) and table.concat(parts, "/") or "-"
+end
+
+local function sampleItemLine(itemId, value, extra)
+    local name = safeFirst(GetItemInfoCustom, itemId)
+    if (not name or name == "") and type(GetItemInfo) == "function" then
+        name = (GetItemInfo(itemId))
+    end
+    local tagsOk, tags1, tags2 = safeCall(GetItemTagsCustom, itemId)
+    if not tagsOk then
+        tags1, tags2 = nil, nil
+    end
+    local classes = value and value.classes
+    return string.format("%s %s | %s | p=%s left=%s | mythic=%s bop=%s | classes=%s%s",
+        tostring(itemId), tostring(name or "?"),
+        tostring(value and value.category or "?"),
+        tostring(value and value.possible or "?"),
+        tostring(value and value.affixesLeft or "?"),
+        tostring(bitAnd(tags1 or 0, 0x80) ~= 0),
+        tostring(bitAnd(tags2 or 0, 0x80) ~= 0),
+        listClasses(classes),
+        extra and (" | " .. extra) or "")
+end
+
+local function addSample(samples, key, line, limit)
+    if not samples[key] then
+        samples[key] = {}
+    end
+    if #samples[key] < limit then
+        samples[key][#samples[key] + 1] = line
+    end
+end
+
+-- Current-zone item-gate diagnostic. This deliberately does not reuse the final
+-- aggregate row: it walks each gate in order so suspicious low counts can be
+-- attributed to source rows, scope/bind/mythic filters, affix masks, or class
+-- attribution. Run inside the instance: /af zonedump acc 8
+local function printZoneItemDump(options)
+    local ready, reason = isCustomReady()
+    if not ready then
+        reportScanError(reason, "dump zone items")
+        return
+    end
+    if AF.busy then
+        reportScanError("busy", "dump zone items")
+        return
+    end
+    beginTask()
+
+    local zoneName = AF.GetCurrentZoneName()
+    local scope = options.scope or AF.defaultScope or "character"
+    local includeMythics = AF.GetConfig("includeMythics") and true or false
+    local sampleLimit = tonumber(options.limit) or 8
+    if sampleLimit < 1 then sampleLimit = 8 end
+    if sampleLimit > 25 then sampleLimit = 25 end
+
+    ensureAffixedIds(function(ids, err)
+        if not ids then
+            endTask()
+            reportScanError(err, "dump zone items")
+            return
+        end
+
+        local counts = {
+            affixedIds = #ids,
+            rawZoneRows = 0,
+            rawZoneItems = 0,
+            creatureZoneItems = 0,
+            includedCandidates = 0,
+            withLeft = 0,
+            totalAffixesLeft = 0,
+            mythicItems = 0,
+            bopItems = 0,
+            scopeDrop = 0,
+            bindDrop = 0,
+            mythicSettingDrop = 0,
+            meleeWeaponDrop = 0,
+            noPossible = 0,
+            noLeft = 0,
+            hunter = 0,
+            druid = 0,
+            hunterOrDruid = 0,
+        }
+        local byCat = {}
+        local samples = {}
+        local progress = makeProgress("zone item dump")
+
+        local function countCat(category, left)
+            category = category or "Unknown"
+            local row = byCat[category]
+            if not row then
+                row = { items = 0, affixes = 0 }
+                byCat[category] = row
+            end
+            row.items = row.items + 1
+            row.affixes = row.affixes + (left or 0)
+        end
+
+        runChunked(#ids, function(i)
+            local itemId = ids[i]
+            local rawRowsHere = 0
+            if type(ItemLocGetSourceCount) == "function" and type(ItemLocGetSourceAt) == "function" then
+                local sourceCount = safeFirst(ItemLocGetSourceCount, itemId) or 0
+                for sourceIndex = 1, sourceCount do
+                    local ok, srcType, srcObjType, srcObjId, _, _, objName, srcZoneName =
+                        safeCall(ItemLocGetSourceAt, itemId, sourceIndex)
+                    if ok and isSameZoneName(srcZoneName, zoneName) then
+                        rawRowsHere = rawRowsHere + 1
+                        if not isCreatureSource(srcType, srcObjType, objName) then
+                            addSample(samples, "rawNonCreature", tostring(itemId) .. " @ "
+                                .. tostring(srcZoneName or "") .. " src=" .. tostring(srcType)
+                                .. " obj=" .. tostring(srcObjType) .. " mob=" .. tostring(objName or ""),
+                                sampleLimit)
+                        end
+                    end
+                end
+            end
+            if rawRowsHere == 0 then
+                return
+            end
+            counts.rawZoneRows = counts.rawZoneRows + rawRowsHere
+            counts.rawZoneItems = counts.rawZoneItems + 1
+
+            local zoneSources = 0
+            local sources = getCreatureSources(itemId)
+            for s = 1, #sources do
+                if isSameZoneName(sources[s].zoneName, zoneName) then
+                    zoneSources = zoneSources + 1
+                end
+            end
+            if zoneSources == 0 then
+                addSample(samples, "noCreatureSource", tostring(itemId) .. " has raw zone rows but no counted killable source", sampleLimit)
+                return
+            end
+            counts.creatureZoneItems = counts.creatureZoneItems + 1
+
+            local tagsOk, tags1, tags2 = safeCall(GetItemTagsCustom, itemId)
+            tags1, tags2 = tagsOk and tags1 or 0, tagsOk and tags2 or 0
+            if bitAnd(tags1 or 0, 0x80) ~= 0 then counts.mythicItems = counts.mythicItems + 1 end
+            if bitAnd(tags2 or 0, 0x80) ~= 0 then counts.bopItems = counts.bopItems + 1 end
+
+            if not itemMatchesScope(itemId, scope) then
+                counts.scopeDrop = counts.scopeDrop + 1
+                addSample(samples, "scopeDrop", tostring(itemId) .. " CanAttune="
+                    .. tostring(safeFirst(CanAttuneItemHelper, itemId)) .. " Someone="
+                    .. tostring(safeFirst(IsAttunableBySomeone, itemId)), sampleLimit)
+                return
+            end
+            if not itemMatchesBind(itemId, options.bindFilter) then
+                counts.bindDrop = counts.bindDrop + 1
+                addSample(samples, "bindDrop", tostring(itemId), sampleLimit)
+                return
+            end
+            if not includeMythics and itemIsMythic(itemId) then
+                counts.mythicSettingDrop = counts.mythicSettingDrop + 1
+                addSample(samples, "mythicDrop", tostring(itemId), sampleLimit)
+                return
+            end
+
+            local itemType, itemSubType, itemEquipLoc
+            if type(GetItemInfoCustom) == "function" then
+                local ok, _, _, _, _, _, it, ist, _, eq = safeCall(GetItemInfoCustom, itemId)
+                if ok then
+                    itemType, itemSubType, itemEquipLoc = it, ist, eq
+                end
+            end
+            if isIgnoredMeleeWeapon(itemType, itemSubType, itemEquipLoc) then
+                counts.meleeWeaponDrop = counts.meleeWeaponDrop + 1
+                local category = getItemCategory(itemType, itemSubType, itemEquipLoc)
+                addSample(samples, "meleeDrop", tostring(itemId) .. " | " .. tostring(category)
+                    .. " | melee weapon ignored | sources=" .. zoneSources, sampleLimit)
+                return
+            end
+
+            local value = affixedItemValue(itemId, scope, options.forgeFilter, options.bindFilter, includeMythics, true)
+            if not value or (value.possible or 0) <= 0 then
+                counts.noPossible = counts.noPossible + 1
+                addSample(samples, "noPossible", sampleItemLine(itemId, value, "sources=" .. zoneSources), sampleLimit)
+                return
+            end
+
+            counts.includedCandidates = counts.includedCandidates + 1
+            if value.classes and value.classes.HUNTER then counts.hunter = counts.hunter + 1 end
+            if value.classes and value.classes.DRUID then counts.druid = counts.druid + 1 end
+            if value.classes and (value.classes.HUNTER or value.classes.DRUID) then
+                counts.hunterOrDruid = counts.hunterOrDruid + 1
+            end
+
+            if (value.affixesLeft or 0) > 0 then
+                counts.withLeft = counts.withLeft + 1
+                counts.totalAffixesLeft = counts.totalAffixesLeft + value.affixesLeft
+                countCat(value.category, value.affixesLeft)
+                addSample(samples, "included", sampleItemLine(itemId, value, "sources=" .. zoneSources), sampleLimit)
+            else
+                counts.noLeft = counts.noLeft + 1
+                addSample(samples, "noLeft", sampleItemLine(itemId, value, "sources=" .. zoneSources), sampleLimit)
+            end
+        end, function()
+            endTask()
+            chat("Zone dump: " .. tostring(zoneName) .. " (" .. filterCaption(scope, options.forgeFilter, options.bindFilter)
+                .. ", mythics " .. (includeMythics and "on" or "off") .. ")")
+            chat(string.format("  affixedIds=%d rawZoneItems=%d rawRows=%d killableZoneItems=%d",
+                counts.affixedIds, counts.rawZoneItems, counts.rawZoneRows, counts.creatureZoneItems))
+            chat(string.format("  candidates=%d itemsWithLeft=%d affixesLeft=%d noLeft=%d noPossible=%d",
+                counts.includedCandidates, counts.withLeft, counts.totalAffixesLeft, counts.noLeft, counts.noPossible))
+            chat(string.format("  drops: scope=%d bind=%d mythicSetting=%d meleeWeapon=%d | zone mythic=%d bop=%d",
+                counts.scopeDrop, counts.bindDrop, counts.mythicSettingDrop,
+                counts.meleeWeaponDrop, counts.mythicItems, counts.bopItems))
+            chat(string.format("  static class attribution among candidates: Hunter=%d Druid=%d Hunter-or-Druid=%d",
+                counts.hunter, counts.druid, counts.hunterOrDruid))
+
+            local catRows = {}
+            for category, cat in pairs(byCat) do
+                catRows[#catRows + 1] = { category = category, items = cat.items, affixes = cat.affixes }
+            end
+            table.sort(catRows, function(a, b)
+                if a.affixes ~= b.affixes then
+                    return a.affixes > b.affixes
+                end
+                if a.items ~= b.items then
+                    return a.items > b.items
+                end
+                return a.category < b.category
+            end)
+            for _, cat in ipairs(catRows) do
+                chat(string.format("  %s: %d items, %d affixes left", cat.category, cat.items, cat.affixes))
+            end
+
+            local sampleOrder = {
+                { "included", "included with affixes left" },
+                { "noLeft", "included candidates with no affixes left" },
+                { "noPossible", "killable zone items with no possible mask" },
+                { "scopeDrop", "scope-gated killable zone items" },
+                { "mythicDrop", "mythic-setting-gated items" },
+                { "meleeDrop", "ignored melee weapons" },
+                { "noCreatureSource", "raw zone rows without counted creature source" },
+                { "rawNonCreature", "sample raw non-creature rows" },
+            }
+            for _, spec in ipairs(sampleOrder) do
+                local rows = samples[spec[1]]
+                if rows and #rows > 0 then
+                    chat("  sample " .. spec[2] .. ":")
+                    for i = 1, #rows do
+                        chat("    " .. rows[i])
+                    end
+                end
+            end
+        end, progress)
+    end)
+end
+
 -- Dumps the raw ItemLocGetSourceAt rows for one item (diagnostic).
 local function printDebugItem(options)
     local itemId = tonumber(options.debugItemId)
@@ -3365,6 +3656,8 @@ local function parseOptions(msg)
             options.debug = true
         elseif token == "zonedbg" or token == "classify" or token == "zoneclass" then
             options.mode = "zonedbg"
+        elseif token == "zonedump" or token == "zoneitems" or token == "itemdump" then
+            options.mode = "zonedump"
         elseif token == "warp" or token == "warpdbg" then
             options.mode = "warpdbg"
         elseif token == "affixdbg" or token == "maskdbg" then
@@ -3443,6 +3736,7 @@ local function printUsage()
     chat("Specific resist: /af resist <fire|nature|frost|shadow|arcane> [char|acc] [best|avg|total] [N] [limit]")
     chat("  e.g. /af resist fire, /af resist frost acc 5, /af resist arcane total 1 15")
     chat("Debug: /af debug <itemId|link> [maxRows], /af zonedbg (zone classification)")
+    chat("  /af zonedump [char|acc] [tf|wf|lf] [bop|boe|both] [sampleRows] (current-zone item gates)")
     chat("  /af warp (current-zone T3 warp-tier probe for the map-warp assist)")
     chat("  /af affixdbg <itemId|link> [maxBits] (affix mask <-> stat mapping probe)")
     chat("  /af affixid <item link> (rolled affix id + ItemAttuneAffix key scheme)")
@@ -3506,6 +3800,8 @@ SlashCmdList["AFFIXFINDER"] = function(msg)
         printResistRankings(options)
     elseif options.mode == "zonedbg" then
         printZoneClassification(options)
+    elseif options.mode == "zonedump" then
+        printZoneItemDump(options)
     elseif options.mode == "warpdbg" then
         printWarpDebug()
     elseif options.mode == "zones" and options.ev then
