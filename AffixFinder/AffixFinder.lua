@@ -44,6 +44,11 @@ AF.configDefaults = {
     minSpawns = 5,
     includeMythics = false,
     automaticWarp = true,
+    -- tooltips : add the AffixFinder line (affixes left + best source) to item
+    --            tooltips everywhere. On by default; off for players who find it
+    --            intrusive. Read live by AffixFinderTooltip.lua (hooks stay
+    --            installed; the line is just skipped when this is false).
+    tooltips = true,
 }
 AF.config = {}
 for k, v in pairs(AF.configDefaults) do
@@ -1413,6 +1418,130 @@ local function affixedItemValue(itemId, scope, forgeFilter, bindFilter, includeM
 end
 
 -- ---------------------------------------------------------------------------
+-- Per-item snapshots (tooltip + Items panel)
+-- ---------------------------------------------------------------------------
+-- These reuse the same gates the scan does, but for ONE item and ON DEMAND, so
+-- they store no state and respect the memory model: hovering an item or building
+-- the Items list never persists anything.
+
+-- Synastria/standard display name for an item id (custom API first), or nil.
+function AF.ItemName(itemId)
+    local name = safeFirst(GetItemInfoCustom, itemId)
+    if (not name or name == "") and type(GetItemInfo) == "function" then
+        name = (GetItemInfo(itemId))
+    end
+    return (name and name ~= "") and name or nil
+end
+
+-- Lazily-built map: GetItemAffixMask bit index -> attunable suffix display name.
+-- Mirrors buildResistIndex's "index == bit position" finding, but keeps the name
+-- for ANY affix family (preferring the prop=true attunable variant) so a remaining
+-- mask bit can be shown as a suffix name. Locale follows ItemAttuneAffix.name.
+local affixNameByIndex
+local function buildAffixNameIndex()
+    local map = {}
+    local iaa = _G.ItemAttuneAffix
+    if type(iaa) ~= "table" then
+        return map
+    end
+    for _, entry in pairs(iaa) do
+        if type(entry) == "table" and type(entry.index) == "number"
+            and type(entry.name) == "string" and entry.name ~= "" then
+            local idx = entry.index
+            if map[idx] == nil or entry.prop then
+                map[idx] = entry.name
+            end
+        end
+    end
+    return map
+end
+
+-- The suffix names still left to attune on an item (possible bits minus attuned
+-- bits, resolved through ItemAttuneAffix). Returns an array; when `limit` is set
+-- and exceeded, it is truncated and `.more` holds the count dropped. nil if the
+-- mask API is unavailable.
+function AF.GetRemainingAffixNames(itemId, limit)
+    if type(GetItemAffixMask) ~= "function" then
+        return nil
+    end
+    local ok, p1, p2, a1, a2 = safeCall(GetItemAffixMask, itemId)
+    if not ok then
+        return nil
+    end
+    if not affixNameByIndex or next(affixNameByIndex) == nil then
+        affixNameByIndex = buildAffixNameIndex()
+    end
+    local names = {}
+    local function collect(mask, base)
+        mask = mask or 0
+        if mask < 0 then
+            mask = mask + 4294967296
+        end
+        local bitPos = 0
+        while mask > 0 do
+            if mask % 2 == 1 then
+                names[#names + 1] = affixNameByIndex[base + bitPos] or ("affix #" .. (base + bitPos))
+            end
+            mask = math.floor(mask / 2)
+            bitPos = bitPos + 1
+        end
+    end
+    collect(maskRemaining(p1, a1), 0)
+    collect(maskRemaining(p2, a2), 32)
+    if limit and #names > limit then
+        local out = {}
+        for i = 1, limit do
+            out[i] = names[i]
+        end
+        out.more = #names - limit
+        return out
+    end
+    return names
+end
+
+-- On-demand affix snapshot for a single item (no stored state) -- the primitive
+-- the item tooltip reuses. Returns nil when the item has no random affix or the
+-- custom APIs are not ready yet. `bestSource` is the densest killable source
+-- (max drop chance, then spawn count) AMONG sources meeting the spawn threshold
+-- (minSpawns, default = the configured minimum), so a 1-spawn mob is not offered
+-- as a farming target when the player's minimum is higher; `sources` is the full
+-- deduped killable-mob list regardless of threshold.
+function AF.GetItemAffixInfo(itemId, minSpawns)
+    itemId = tonumber(itemId)
+    if not itemId or type(GetItemAffixMask) ~= "function" then
+        return nil
+    end
+    if not itemHasRandomAffix(itemId) then
+        return nil
+    end
+    local possible, left = getMaskAffixCounts(itemId)
+    if possible <= 0 then
+        return nil
+    end
+    minSpawns = tonumber(minSpawns) or tonumber(AF.GetConfig("minSpawns")) or 0
+    local sources = getCreatureSources(itemId)
+    local best
+    for _, s in ipairs(sources) do
+        if (s.spawnedCount or 0) >= minSpawns then
+            if not best or s.dropProbability > best.dropProbability
+                or (s.dropProbability == best.dropProbability and s.spawnedCount > best.spawnedCount) then
+                best = s
+            end
+        end
+    end
+    return {
+        itemId = itemId,
+        possible = possible,
+        left = left,
+        unattuned = itemIsUnattuned(itemId),
+        canCharacter = (safeFirst(CanAttuneItemHelper, itemId) or 0) > 0,
+        canAccount = (safeFirst(IsAttunableBySomeone, itemId) or 0) ~= 0,
+        sources = sources,
+        bestSource = best,
+    }
+end
+
+-- ---------------------------------------------------------------------------
 -- Specific-resist mode (farm one chosen resistance)
 -- ---------------------------------------------------------------------------
 -- Synastria resist attunement grants a flat 20%-per-forge-level of the item's
@@ -1848,6 +1977,12 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
         local rowsByZone = {}
         local rows = {}
         local mobsByKey = {}
+        -- Central per-item record (in-memory aggregate, like mobsByKey -- never
+        -- persisted). One entry per affixed item that still has affixes left and
+        -- a killable source; the Items panel and per-item views read it without a
+        -- rescan. Holds only small scalars + the shared category/class set (no
+        -- source rows, no strings beyond category); mobs carry the id lists.
+        local itemsById = {}
         local affixedItemsScanned = 0
         local progress = makeProgress("mob sources")
         -- Per-class breakdown only matters in account scope (character scope is
@@ -1871,6 +2006,19 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
             local unattuned = value.unattuned
             local category = value.category
             local classes = value.classes
+
+            -- Record the item once (only when it still has affixes left, since
+            -- only those reach the mob lists below and the Items panel).
+            if affixesLeft > 0 and not itemsById[itemId] then
+                itemsById[itemId] = {
+                    itemId = itemId,
+                    category = category,
+                    possible = value.possible,
+                    affixesLeft = affixesLeft,
+                    unattuned = unattuned,
+                    classes = classes,
+                }
+            end
 
             local seenZone = {}
             for s = 1, #sources do
@@ -1934,6 +2082,9 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
                             evPerKill = 0,
                             itemsDropped = 0,
                             affixesLeft = 0,
+                            -- itemIds this mob drops that still have affixes left
+                            -- (refs into itemsById; the Items panel reads these).
+                            items = {},
                             -- Account scope only: per-class EV/items/affixes for
                             -- this mob (classToken -> tally). Empty otherwise.
                             byClass = {},
@@ -1944,6 +2095,7 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
                     mob.evPerKill = mob.evPerKill + evDelta
                     mob.itemsDropped = mob.itemsDropped + 1
                     mob.affixesLeft = mob.affixesLeft + affixesLeft
+                    mob.items[#mob.items + 1] = itemId
                     if src.spawnedCount > mob.spawnedCount then
                         mob.spawnedCount = src.spawnedCount
                     end
@@ -1971,6 +2123,7 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
                 rows = rows,
                 rowsByZone = rowsByZone,
                 mobsByKey = mobsByKey,
+                itemsById = itemsById,
                 affixedItemsScanned = affixedItemsScanned,
             })
         end, progress)
@@ -2566,6 +2719,129 @@ function AF.BuildClassRankings(data, zonePassFn)
         return tostring(a.className or "") < tostring(b.className or "")
     end)
     return rows
+end
+
+-- Returns the individual affixed ITEMS (one row per item id) that still have
+-- affixes left and drop from a killable mob passing the spawn / zone-substring /
+-- class filters. Pure display-time over the slice's itemsById + per-mob item
+-- lists, so it never rescans. Each row carries the densest known source mob
+-- (bestMob*) so a click can pin it like the Mobs panel.
+--   minSpawns  : drop mobs below this reported spawn count (like BuildMobList)
+--   classToken : account scope -- keep only items usable by this class (nil = all)
+--   zoneNeedle : case-insensitive substring on the source mob's zone (nil = all)
+function AF.BuildItemList(data, minSpawns, classToken, zoneNeedle)
+    minSpawns = tonumber(minSpawns) or 1
+    if minSpawns < 0 then
+        minSpawns = 0
+    end
+    local needle = (type(zoneNeedle) == "string" and zoneNeedle ~= "") and string.lower(zoneNeedle) or nil
+    local itemsById = data.itemsById or {}
+    local seen = {}
+    local rows = {}
+    for _, mob in pairs(data.mobsByKey) do
+        if mob.items and mob.spawnedCount >= minSpawns
+            and (not needle or (mob.zoneName and string.find(string.lower(mob.zoneName), needle, 1, true))) then
+            for _, itemId in ipairs(mob.items) do
+                local rec = itemsById[itemId]
+                if rec and rec.affixesLeft > 0
+                    and ((not classToken) or (rec.classes and rec.classes[classToken])) then
+                    local r = seen[itemId]
+                    if not r then
+                        r = {
+                            itemId = itemId,
+                            category = rec.category,
+                            possible = rec.possible,
+                            affixesLeft = rec.affixesLeft,
+                            unattuned = rec.unattuned,
+                            sourceMobs = 0,
+                            bestMobName = mob.npcName,
+                            bestMobNpcId = mob.npcId,
+                            bestMobZone = mob.zoneName,
+                            bestMobSpawns = mob.spawnedCount,
+                        }
+                        seen[itemId] = r
+                        rows[#rows + 1] = r
+                    end
+                    r.sourceMobs = r.sourceMobs + 1
+                    if mob.spawnedCount > (r.bestMobSpawns or 0) then
+                        r.bestMobName = mob.npcName
+                        r.bestMobNpcId = mob.npcId
+                        r.bestMobZone = mob.zoneName
+                        r.bestMobSpawns = mob.spawnedCount
+                    end
+                end
+            end
+        end
+    end
+    table.sort(rows, function(a, b)
+        if a.affixesLeft ~= b.affixesLeft then
+            return a.affixesLeft > b.affixesLeft
+        end
+        return (a.itemId or 0) < (b.itemId or 0)
+    end)
+    return rows
+end
+
+-- Sums the slice's remaining affix value by expansion (classic/tbc/wotlk/other),
+-- for the Progress dashboard. Honours the same display-time zone filter the other
+-- panels use (zonePassFn) and an optional class slice. Sorted by affixes left.
+function AF.BuildExpansionBreakdown(data, zonePassFn, classToken)
+    local order = { "classic", "tbc", "wotlk", "unknown" }
+    local labels = { classic = "Classic", tbc = "TBC", wotlk = "WotLK", unknown = "Other/unknown" }
+    local acc = {}
+    for _, exp in ipairs(order) do
+        acc[exp] = {
+            expansion = exp, label = labels[exp],
+            totalAffixesLeft = 0, affixedItemsWithAffixesLeft = 0,
+            unattunedAffixedItems = 0, zones = 0,
+        }
+    end
+    for _, row in ipairs(data.rows) do
+        if (not zonePassFn) or zonePassFn(row.zoneName) then
+            local src = row
+            if classToken then
+                src = row.byClass and row.byClass[classToken]
+            end
+            if src and src.totalAffixesLeft > 0 then
+                local _, exp = AF.ClassifyZone(row.zoneName)
+                local a = acc[exp] or acc.unknown
+                a.totalAffixesLeft = a.totalAffixesLeft + src.totalAffixesLeft
+                a.affixedItemsWithAffixesLeft = a.affixedItemsWithAffixesLeft + src.affixedItemsWithAffixesLeft
+                a.unattunedAffixedItems = a.unattunedAffixedItems + src.unattunedAffixedItems
+                a.zones = a.zones + 1
+            end
+        end
+    end
+    local rows = {}
+    for _, exp in ipairs(order) do
+        -- Skip the "Other/unknown" bucket: zones we can't place (it still
+        -- accumulates above so they aren't misfiled into a real expansion).
+        if exp ~= "unknown" and acc[exp].totalAffixesLeft > 0 then
+            rows[#rows + 1] = acc[exp]
+        end
+    end
+    table.sort(rows, function(a, b) return a.totalAffixesLeft > b.totalAffixesLeft end)
+    return rows
+end
+
+-- Account-wide attunement totals from the Synastria count APIs (independent of
+-- the killable-mob slice), for the Progress dashboard headline. Every field is
+-- optional -- the panel degrades gracefully when an API is missing.
+function AF.GetAttuneProgressSummary()
+    local s = {}
+    if type(CalculateAttunedAffixCount) == "function" then
+        s.attunedAffixes = tonumber(safeFirst(CalculateAttunedAffixCount))
+    end
+    if type(CalculateAttunableAffixCount) == "function" then
+        s.attunableAffixes = tonumber(safeFirst(CalculateAttunableAffixCount))
+    end
+    if type(CalculateAttunedCount) == "function" then
+        s.attunedItems = tonumber(safeFirst(CalculateAttunedCount))
+    end
+    if s.attunedAffixes and s.attunableAffixes and s.attunableAffixes > 0 then
+        s.affixPercent = 100 * s.attunedAffixes / s.attunableAffixes
+    end
+    return s
 end
 
 -- Groups the per-mob expected-value data into per-zone scores for a given

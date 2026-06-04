@@ -232,6 +232,11 @@ UI.filters = {
     -- panel down to matching zones. Display-time, MOBS-ONLY -- it never rescans
     -- and never narrows the Zones list itself. Matched case-insensitively.
     zone = nil,
+    -- item: nil = all items. The Items panel's search substring, matched against
+    -- the item NAME or its best-mob zone (an item view should search by item, not
+    -- only zone). Display-time, ITEMS-ONLY; kept separate from `zone` so the two
+    -- panels' search boxes never contaminate each other.
+    item = nil,
 }
 
 local function CurrentForgeFilter()
@@ -316,6 +321,155 @@ end
 --   buildControls(strip) (optional): create panel-specific controls once
 
 local function num(v) return v or 0 end
+
+-- Give an EditBox a flat dark field with a 1px solid border. Used instead of
+-- InputBoxTemplate, whose middle/corner border textures tile and show seams at
+-- our widths (a bright vertical "cut" mid-field). A solid edge has no pieces to
+-- seam, so it renders cleanly at any size.
+local function ApplyFlatEditBoxStyle(eb)
+    eb:SetBackdrop({
+        bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
+        edgeFile = "Interface\\ChatFrame\\ChatFrameBackground",
+        edgeSize = 1,
+        insets = { left = 1, right = 1, top = 1, bottom = 1 },
+    })
+    eb:SetBackdropColor(0, 0, 0, 0.6)
+    eb:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+end
+
+-- Shared panel control strip: a search substring box (with Clear, and an
+-- optional "Curr" current-zone shortcut) and a Min-spawns box. `filterKey` is
+-- the UI.filters field the box drives ("zone" for Mobs, "item" for Items),
+-- `label` / `placeholderText` label it. `withCurr` adds the current-zone button
+-- (only meaningful for a zone search). Used by the Mobs and Items panels; sets
+-- panel._edit / panel._searchEdit / panel._searchKey / panel._updatePlaceholder.
+local function BuildSearchSpawnControls(panel, strip, label, filterKey, placeholderText, withCurr)
+    panel.minSpawns = AF.GetConfig("minSpawns")  -- seed from the saved default
+    panel._searchKey = filterKey
+
+    local zoneLabel = MakeText(strip, "OVERLAY", "GameFontNormalSmall")
+    zoneLabel:SetPoint("LEFT", 0, 0)
+    zoneLabel:SetText(label)
+
+    -- A plain backdrop EditBox rather than InputBoxTemplate: the template's
+    -- middle border texture TILES, so at this width a tile seam lands mid-box and
+    -- shows as a bright vertical "cut". A stretched backdrop renders continuously
+    -- at any width.
+    local zoneEdit = CreateFrame("EditBox", nil, strip)
+    zoneEdit:SetAutoFocus(false)
+    zoneEdit:SetMaxLetters(40)
+    zoneEdit:SetWidth(150)
+    zoneEdit:SetHeight(18)
+    zoneEdit:SetPoint("LEFT", zoneLabel, "RIGHT", 8, 0)
+    zoneEdit:SetFontObject(GameFontHighlightSmall)
+    zoneEdit:SetTextInsets(6, 6, 0, 0)
+    ApplyFlatEditBoxStyle(zoneEdit)
+
+    local placeholder = MakeText(zoneEdit, "OVERLAY", "GameFontDisableSmall", "LEFT")
+    placeholder:SetPoint("LEFT", 6, 0)
+    placeholder:SetText(placeholderText or "all")
+    local function updatePlaceholder()
+        if zoneEdit:GetText() == "" and not zoneEdit:HasFocus() then
+            placeholder:Show()
+        else
+            placeholder:Hide()
+        end
+    end
+
+    local function commitZone()
+        local txt = zoneEdit:GetText() or ""
+        txt = string.gsub(txt, "^%s+", "")
+        txt = string.gsub(txt, "%s+$", "")
+        UI.filters[filterKey] = (txt ~= "") and txt or nil
+        zoneEdit:ClearFocus()
+        updatePlaceholder()
+        UI.RefreshActivePanel()
+    end
+    zoneEdit:SetScript("OnEnterPressed", commitZone)
+    zoneEdit:SetScript("OnEditFocusLost", commitZone)
+    zoneEdit:SetScript("OnEditFocusGained", function() placeholder:Hide() end)
+    zoneEdit:SetScript("OnEscapePressed", function(s) s:ClearFocus() end)
+
+    local clearBtn = CreateFrame("Button", nil, strip, "UIPanelButtonTemplate")
+    clearBtn:SetSize(46, 18)
+    clearBtn:SetPoint("LEFT", zoneEdit, "RIGHT", 4, 0)
+    clearBtn:SetText("Clear")
+    clearBtn:SetScript("OnClick", function()
+        zoneEdit:SetText("")
+        UI.filters[filterKey] = nil
+        zoneEdit:ClearFocus()
+        updatePlaceholder()
+        UI.RefreshActivePanel()
+    end)
+
+    local lastAnchor = clearBtn
+    if withCurr then
+        local currBtn = CreateFrame("Button", nil, strip, "UIPanelButtonTemplate")
+        currBtn:SetSize(46, 18)
+        currBtn:SetPoint("LEFT", clearBtn, "RIGHT", 4, 0)
+        currBtn:SetText("Curr")
+        currBtn:SetScript("OnClick", function()
+            local zone = AF.GetCurrentZoneName()
+            zoneEdit:SetText(zone or "")
+            UI.filters[filterKey] = (zone and zone ~= "") and zone or nil
+            zoneEdit:ClearFocus()
+            updatePlaceholder()
+            UI.RefreshActivePanel()
+        end)
+        currBtn:SetScript("OnEnter", function(s)
+            GameTooltip:SetOwner(s, "ANCHOR_TOP")
+            GameTooltip:AddLine("Filter to your current zone", 1, 1, 1)
+            GameTooltip:AddLine(AF.GetCurrentZoneName() or "?", 0.8, 0.8, 0.8)
+            GameTooltip:Show()
+        end)
+        currBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        lastAnchor = currBtn
+    end
+
+    local spawnLabel = MakeText(strip, "OVERLAY", "GameFontNormalSmall")
+    spawnLabel:SetPoint("LEFT", lastAnchor, "RIGHT", 18, 0)
+    spawnLabel:SetText("Min spawns:")
+
+    local edit = CreateFrame("EditBox", nil, strip)
+    edit:SetAutoFocus(false)
+    edit:SetNumeric(true)
+    edit:SetMaxLetters(4)
+    edit:SetWidth(40)
+    edit:SetHeight(18)
+    edit:SetPoint("LEFT", spawnLabel, "RIGHT", 8, 0)
+    edit:SetFontObject(GameFontHighlightSmall)
+    edit:SetTextInsets(5, 5, 0, 0)
+    edit:SetJustifyH("CENTER")
+    ApplyFlatEditBoxStyle(edit)
+    edit:SetText(tostring(panel.minSpawns))
+    local function commit()
+        local n = tonumber(edit:GetText())
+        if not n or n < 0 then n = 0 end
+        panel.minSpawns = n
+        panel._userSetSpawns = true  -- stop following the saved default this session
+        edit:SetText(tostring(n))
+        edit:ClearFocus()
+        UI.RefreshActivePanel()
+    end
+    edit:SetScript("OnEnterPressed", commit)
+    edit:SetScript("OnEditFocusLost", commit)
+
+    local hint = MakeText(strip, "OVERLAY", "GameFontDisableSmall")
+    hint:SetPoint("LEFT", edit, "RIGHT", 8, 0)
+    hint:SetText("(0 = include sparse mobs)")
+
+    panel._edit = edit
+    panel._searchEdit = zoneEdit
+    panel._updatePlaceholder = updatePlaceholder
+end
+
+local function SyncSearchSpawnControls(panel)
+    if panel._edit then panel._edit:SetText(tostring(panel.minSpawns)) end
+    if panel._searchEdit then
+        panel._searchEdit:SetText(UI.filters[panel._searchKey] or "")
+        if panel._updatePlaceholder then panel._updatePlaceholder() end
+    end
+end
 
 local PANELS = {}
 
@@ -441,119 +595,107 @@ PANELS[#PANELS + 1] = {
         return lines
     end,
     buildControls = function(panel, strip)
-        panel.minSpawns = AF.GetConfig("minSpawns")  -- seed from the saved default
+        BuildSearchSpawnControls(panel, strip, "Zone:", "zone", "all zones", true)
+    end,
+    syncControls = SyncSearchSpawnControls,
+}
 
-        -- Zone filter box (display-time, Mobs-only). Type a substring, or click a
-        -- row in the Zones panel to fill it with that zone's name. Empty = all.
-        local zoneLabel = MakeText(strip, "OVERLAY", "GameFontNormalSmall")
-        zoneLabel:SetPoint("LEFT", 0, 0)
-        zoneLabel:SetText("Zone:")
-
-        local zoneEdit = CreateFrame("EditBox", nil, strip, "InputBoxTemplate")
-        zoneEdit:SetAutoFocus(false)
-        zoneEdit:SetMaxLetters(40)
-        zoneEdit:SetWidth(150)
-        zoneEdit:SetHeight(18)
-        zoneEdit:SetPoint("LEFT", zoneLabel, "RIGHT", 8, 0)
-
-        -- Faint placeholder shown while the box is empty and unfocused.
-        local placeholder = MakeText(zoneEdit, "OVERLAY", "GameFontDisableSmall", "LEFT")
-        placeholder:SetPoint("LEFT", 6, 0)
-        placeholder:SetText("all zones")
-        local function updatePlaceholder()
-            if zoneEdit:GetText() == "" and not zoneEdit:HasFocus() then
-                placeholder:Show()
-            else
-                placeholder:Hide()
+-- --- Panel: Items (the actual affixed items still worth farming) ----------
+-- One row per affixed item that still has affixes left and drops from a killable
+-- mob passing the filters. The drill-down target of Zones -> Mobs -> Items: it
+-- shares the Mobs panel's Zone box + Min-spawns control (and the click-to-pin
+-- best mob), so a Zones-row click flows straight through to "what do I farm here
+-- and which suffix do I still need". Names resolve lazily at render.
+PANELS[#PANELS + 1] = {
+    id = "items",
+    title = "Items",
+    defaultSort = 3,
+    zoneField = "bestMobZone",  -- honour the display-time category/expansion filters
+    minSpawns = 5,
+    columns = {
+        { title = "Item", width = 214, justify = "LEFT",
+          value = function(e) return e._name or ("item " .. tostring(e.itemId)) end },
+        { title = "Category", width = 92, justify = "LEFT",
+          value = function(e) return e.category or "" end },
+        { title = "Affixes left", width = 86, justify = "RIGHT", numeric = true,
+          headerTooltip = "Suffixes still left to attune on this item (possible suffixes minus the ones you've attuned).",
+          value = function(e) return num(e.affixesLeft) end },
+        { title = "Possible", width = 66, justify = "RIGHT", numeric = true,
+          headerTooltip = "Total suffixes this item can roll.",
+          value = function(e) return num(e.possible) end },
+        { title = "Best mob", width = 128, justify = "LEFT",
+          headerTooltip = "Densest mob (by spawn count) that drops this item among the zones passing your filters. Click the row to pin it on the map.",
+          value = function(e) return e.bestMobName or "" end },
+    },
+    getRows = function(data, panel)
+        -- No zone needle into BuildItemList: this panel searches by item name (or
+        -- zone) below, so all items pass the spawn/class gate first.
+        local rows = AF.BuildItemList(data, panel.minSpawns, UI.filters.class, nil)
+        -- Resolve display names once per build (the comparator tiebreaks on them
+        -- and the cells show them); the list itself is virtualized.
+        for _, e in ipairs(rows) do
+            if e._name == nil then
+                e._name = (AF.ItemName and AF.ItemName(e.itemId)) or ("item " .. tostring(e.itemId))
             end
         end
-
-        local function commitZone()
-            local txt = zoneEdit:GetText() or ""
-            txt = string.gsub(txt, "^%s+", "")
-            txt = string.gsub(txt, "%s+$", "")
-            UI.filters.zone = (txt ~= "") and txt or nil
-            zoneEdit:ClearFocus()
-            updatePlaceholder()
-            UI.RefreshActivePanel()
+        -- Search box (UI.filters.item): match the item NAME only. This is an
+        -- item view -- the player is looking for an item and will go wherever the
+        -- addon sends them, so matching the zone too (e.g. "pen" hitting Hellfire
+        -- Peninsula drops) would only add confusing, irrelevant rows.
+        local needle = UI.filters.item
+        if needle and needle ~= "" then
+            needle = string.lower(needle)
+            local filtered = {}
+            for _, e in ipairs(rows) do
+                if string.find(string.lower(e._name or ""), needle, 1, true) then
+                    filtered[#filtered + 1] = e
+                end
+            end
+            rows = filtered
         end
-        zoneEdit:SetScript("OnEnterPressed", commitZone)
-        zoneEdit:SetScript("OnEditFocusLost", commitZone)
-        zoneEdit:SetScript("OnEditFocusGained", function() placeholder:Hide() end)
-        zoneEdit:SetScript("OnEscapePressed", function(s) s:ClearFocus() end)
-
-        local clearBtn = CreateFrame("Button", nil, strip, "UIPanelButtonTemplate")
-        clearBtn:SetSize(46, 18)
-        clearBtn:SetPoint("LEFT", zoneEdit, "RIGHT", 4, 0)
-        clearBtn:SetText("Clear")
-        clearBtn:SetScript("OnClick", function()
-            zoneEdit:SetText("")
-            UI.filters.zone = nil
-            zoneEdit:ClearFocus()
-            updatePlaceholder()
-            UI.RefreshActivePanel()
-        end)
-
-        -- "Curr": filter to the zone the player is standing in right now.
-        local currBtn = CreateFrame("Button", nil, strip, "UIPanelButtonTemplate")
-        currBtn:SetSize(46, 18)
-        currBtn:SetPoint("LEFT", clearBtn, "RIGHT", 4, 0)
-        currBtn:SetText("Curr")
-        currBtn:SetScript("OnClick", function()
-            local zone = AF.GetCurrentZoneName()
-            zoneEdit:SetText(zone or "")
-            UI.filters.zone = (zone and zone ~= "") and zone or nil
-            zoneEdit:ClearFocus()
-            updatePlaceholder()
-            UI.RefreshActivePanel()
-        end)
-        currBtn:SetScript("OnEnter", function(s)
-            GameTooltip:SetOwner(s, "ANCHOR_TOP")
-            GameTooltip:AddLine("Filter to your current zone", 1, 1, 1)
-            GameTooltip:AddLine(AF.GetCurrentZoneName() or "?", 0.8, 0.8, 0.8)
-            GameTooltip:Show()
-        end)
-        currBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-        local spawnLabel = MakeText(strip, "OVERLAY", "GameFontNormalSmall")
-        spawnLabel:SetPoint("LEFT", currBtn, "RIGHT", 18, 0)
-        spawnLabel:SetText("Min spawns:")
-
-        local edit = CreateFrame("EditBox", nil, strip, "InputBoxTemplate")
-        edit:SetAutoFocus(false)
-        edit:SetNumeric(true)
-        edit:SetMaxLetters(4)
-        edit:SetWidth(40)
-        edit:SetHeight(18)
-        edit:SetPoint("LEFT", spawnLabel, "RIGHT", 8, 0)
-        edit:SetText(tostring(panel.minSpawns))
-        local function commit()
-            local n = tonumber(edit:GetText())
-            if not n or n < 0 then n = 0 end
-            panel.minSpawns = n
-            panel._userSetSpawns = true  -- stop following the saved default this session
-            edit:SetText(tostring(n))
-            edit:ClearFocus()
-            UI.RefreshActivePanel()
-        end
-        edit:SetScript("OnEnterPressed", commit)
-        edit:SetScript("OnEditFocusLost", commit)
-
-        local hint = MakeText(strip, "OVERLAY", "GameFontDisableSmall")
-        hint:SetPoint("LEFT", edit, "RIGHT", 8, 0)
-        hint:SetText("(0 = include sparse mobs)")
-
-        panel._edit = edit
-        panel._zoneEdit = zoneEdit
-        panel._updateZonePlaceholder = updatePlaceholder
+        return rows
     end,
-    syncControls = function(panel)
-        if panel._edit then panel._edit:SetText(tostring(panel.minSpawns)) end
-        if panel._zoneEdit then
-            panel._zoneEdit:SetText(UI.filters.zone or "")
-            if panel._updateZonePlaceholder then panel._updateZonePlaceholder() end
+    onRowClick = function(entry)
+        if AF.TryWarpToMob and entry.bestMobNpcId then
+            AF.TryWarpToMob({
+                npcId = entry.bestMobNpcId,
+                npcName = entry.bestMobName,
+                zoneName = entry.bestMobZone,
+            })
         end
     end,
+    summary = function(data, n, panel)
+        local sf = UI.filters.item
+        local searchPart = (sf and sf ~= "") and string.format(" matching \"%s\"", sf) or ""
+        local warpPart = AF.GetConfig("automaticWarp") and " -- click an item to pin its best mob/open map" or " -- click an item to pin its best mob"
+        return string.format("%d items with affixes left%s (%s; min spawns %d)%s",
+            n, searchPart, FilterCaption(), panel.minSpawns, warpPart)
+    end,
+    tooltip = function(e)
+        local lines = {
+            { left = e._name or ("item " .. tostring(e.itemId)),
+              right = string.format("%d/%d affixes left", num(e.affixesLeft), num(e.possible)) },
+            { left = "  Category", right = e.category or "?" },
+            { left = "  Best mob", right = string.format("%s (%s, %d spawns)",
+                tostring(e.bestMobName or "?"), tostring(e.bestMobZone or "?"), num(e.bestMobSpawns)) },
+            { left = "  Mobs that drop it (this filter)", right = tostring(num(e.sourceMobs)) },
+        }
+        local names = AF.GetRemainingAffixNames and AF.GetRemainingAffixNames(e.itemId, 10)
+        if names and #names > 0 then
+            lines[#lines + 1] = { left = "  Suffixes still needed:" }
+            for _, nm in ipairs(names) do
+                lines[#lines + 1] = { left = "    " .. nm }
+            end
+            if names.more then
+                lines[#lines + 1] = { left = string.format("    +%d more", names.more) }
+            end
+        end
+        return lines
+    end,
+    buildControls = function(panel, strip)
+        BuildSearchSpawnControls(panel, strip, "Search:", "item", "item name")
+    end,
+    syncControls = SyncSearchSpawnControls,
 }
 
 -- --- Panel: Current Zone (per-category breakdown for the player's zone) -----
@@ -784,13 +926,17 @@ PANELS[#PANELS + 1] = {
         spawnLabel:SetPoint("LEFT", prev, "RIGHT", 16, 0)
         spawnLabel:SetText("Min spawns:")
 
-        local edit = CreateFrame("EditBox", nil, strip, "InputBoxTemplate")
+        local edit = CreateFrame("EditBox", nil, strip)
         edit:SetAutoFocus(false)
         edit:SetNumeric(true)
         edit:SetMaxLetters(4)
         edit:SetWidth(40)
         edit:SetHeight(18)
         edit:SetPoint("LEFT", spawnLabel, "RIGHT", 8, 0)
+        edit:SetFontObject(GameFontHighlightSmall)
+        edit:SetTextInsets(5, 5, 0, 0)
+        edit:SetJustifyH("CENTER")
+        ApplyFlatEditBoxStyle(edit)
         edit:SetText(tostring(panel.minSpawns))
         local function commit()
             local n = tonumber(edit:GetText())
@@ -811,6 +957,56 @@ PANELS[#PANELS + 1] = {
     syncControls = function(panel)
         if panel._elemSeg then panel._elemSeg:SetValue(panel.element, false) end
         if panel._edit then panel._edit:SetText(tostring(panel.minSpawns)) end
+    end,
+}
+
+-- --- Panel: Progress (completion dashboard) -------------------------------
+-- Two layers: a headline summary of account-wide attunement from the Synastria
+-- count APIs (independent of the killable-mob slice; degrades if an API is
+-- missing), and per-expansion rows of the FARMABLE affixes still left in the
+-- current filter. Uses the shared ComputeZoneData slice; rows are expansions, so
+-- (like Classes) it filters zones internally via ZonePasses instead of zoneField.
+PANELS[#PANELS + 1] = {
+    id = "progress",
+    title = "Progress",
+    defaultSort = 2,
+    columns = {
+        { title = "Expansion", width = 150, justify = "LEFT",
+          value = function(e) return e.label or "" end },
+        { title = "Affixes left", width = 100, justify = "RIGHT", numeric = true,
+          headerTooltip = "Farmable affixes still left in this expansion (this filter, killable mob sources).",
+          value = function(e) return num(e.totalAffixesLeft) end },
+        { title = "Zones", width = 84, justify = "RIGHT", numeric = true,
+          headerTooltip = "Zones in this expansion that still have remaining affix value.",
+          value = function(e) return num(e.zones) end },
+        { title = "Items w/ left", width = 110, justify = "RIGHT", numeric = true,
+          headerTooltip = "Affixed items in this expansion with at least one affix left to attune.",
+          value = function(e) return num(e.affixedItemsWithAffixesLeft) end },
+    },
+    getRows = function(data)
+        return AF.BuildExpansionBreakdown(data, ZonePasses, UI.filters.class)
+    end,
+    summary = function(data, n)
+        local s = (AF.GetAttuneProgressSummary and AF.GetAttuneProgressSummary()) or {}
+        local parts = {}
+        if s.attunedAffixes and s.attunableAffixes then
+            local pct = s.affixPercent and string.format(" (%.1f%%)", s.affixPercent) or ""
+            parts[#parts + 1] = string.format("Account affixes attuned: %d / %d%s",
+                s.attunedAffixes, s.attunableAffixes, pct)
+        end
+        if s.attunedItems then
+            parts[#parts + 1] = string.format("items attuned: %d", s.attunedItems)
+        end
+        local head = (#parts > 0) and (table.concat(parts, "  |  ") .. "  --  ") or ""
+        return head .. string.format("farmable remaining by expansion (%s)", FilterCaption())
+    end,
+    tooltip = function(e)
+        return {
+            { left = e.label, right = string.format("%d affixes left", num(e.totalAffixesLeft)) },
+            { left = "  Zones with remaining value", right = tostring(num(e.zones)) },
+            { left = "  Items with affixes left", right = tostring(num(e.affixedItemsWithAffixesLeft)) },
+            { left = "  Not yet attuned at all", right = tostring(num(e.unattunedAffixedItems)) },
+        }
     end,
 }
 
@@ -1492,7 +1688,7 @@ end
 -- before the window has ever been built.
 function UI.ApplyConfig()
     for _, p in ipairs(PANELS) do
-        if (p.id == "mobs" or p.id == "resist") and not p._userSetSpawns then
+        if (p.id == "mobs" or p.id == "resist" or p.id == "items") and not p._userSetSpawns then
             p.minSpawns = AF.GetConfig("minSpawns")
             if p._edit then p._edit:SetText(tostring(p.minSpawns)) end
         end

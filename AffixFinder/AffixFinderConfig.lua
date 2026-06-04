@@ -127,6 +127,18 @@ autoWarp:SetScript("OnClick", function(self)
     SaveConfig("automaticWarp", self:GetChecked() and true or false)
 end)
 
+-- --- Item tooltips (checkbox) ----------------------------------------------
+local tooltips = CreateFrame("CheckButton", "AffixFinderTooltipsCheck", panel,
+    "InterfaceOptionsCheckButtonTemplate")
+tooltips:SetPoint("TOPLEFT", autoWarp, "BOTTOMLEFT", 0, -10)
+SetRegionText(tooltips:GetName(), "Text", "Add affix info to item tooltips")
+tooltips.tooltipText = "Adds an AffixFinder line to item tooltips everywhere (bags, bank, auction "
+    .. "house, loot, links): affixes left to attune, and the best mob to farm the item from when any "
+    .. "remain. Enabled by default; turn off if you find it intrusive."
+tooltips:SetScript("OnClick", function(self)
+    SaveConfig("tooltips", self:GetChecked() and true or false)
+end)
+
 -- --- Slider helper ----------------------------------------------------------
 -- OptionsSliderTemplate gives us $parentLow / $parentHigh / $parentText regions.
 -- We fold the live value into $parentText so the current setting is always shown
@@ -173,7 +185,7 @@ local rescanSlider = BuildSlider(
         return v .. " min"
     end,
     "rescanInterval",
-    autoWarp, -48)
+    tooltips, -48)
 rescanSlider.tooltipText = "How often an automatic rescan may run for a given filter after the "
     .. "addon detects a change (e.g. you attune something). 0 = rescan on every detected change. "
     .. "The Rescan button and changing filters always rescan immediately."
@@ -196,6 +208,7 @@ spawnSlider.tooltipText = "Default minimum reported spawn count for a mob to app
 local function RefreshWidgets()
     mythic:SetChecked(AF.GetConfig("includeMythics") and true or false)
     autoWarp:SetChecked(AF.GetConfig("automaticWarp") and true or false)
+    tooltips:SetChecked(AF.GetConfig("tooltips") ~= false)
 
     -- Guard against the OnValueChanged handler writing back while we load.
     rescanSlider._loading, spawnSlider._loading = true, true

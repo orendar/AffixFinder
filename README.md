@@ -48,11 +48,17 @@ The window includes:
 
 - **Zones** - zone rankings by remaining affix value
 - **Mobs** - individual mob rankings, with zone and spawn filters
+- **Items** - the actual affixed items still worth farming, with the specific suffixes you still need and the best mob to farm each from
 - **Current Zone** - what is still useful where you are standing
 - **Classes** - account-scope class breakdowns
 - **Resist** - targeted farming for one resistance school
+- **Progress** - account attunement completion and farmable affixes left by expansion
 
-Clicking a mob row marks that mob on the map. Questie is optional; without it, AffixFinder still uses Synastria's own tracking when available.
+Clicking a mob (or an item's best-mob) row marks that mob on the map. Questie is optional; without it, AffixFinder still uses Synastria's own tracking when available.
+
+### Tooltips
+
+AffixFinder also adds a line to item tooltips everywhere in the game (bags, bank, auction house, loot, quest rewards, chat links, LootDB): how many affixes are still left to attune on the item and, when any remain, the best killable source and the suffixes you still need. No window required.
 
 ## Settings
 
