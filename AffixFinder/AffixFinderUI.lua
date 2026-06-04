@@ -121,6 +121,17 @@ local function CreateSegmented(parent, options, onSelect)
         end
     end
 
+    -- Enable/disable the whole group (used to grey out filters a panel ignores).
+    -- Re-applies the current selection so the pushed/locked look is restored.
+    function seg:SetEnabled(enabled)
+        for _, b in ipairs(self.buttons) do
+            if enabled then b:Enable() else b:Disable() end
+        end
+        if enabled then
+            self:SetValue(self.value, false)
+        end
+    end
+
     return seg
 end
 
@@ -175,6 +186,14 @@ local function CreateMultiSegmented(parent, options, selectedSet, onChange)
         end
         self:Apply()
         if onChange then onChange(self) end
+    end
+
+    -- Enable/disable the whole group (see CreateSegmented:SetEnabled).
+    function seg:SetEnabled(enabled)
+        for _, b in ipairs(self.buttons) do
+            if enabled then b:Enable() else b:Disable() end
+        end
+        if enabled then self:Apply() end
     end
 
     seg:Apply()
@@ -310,10 +329,13 @@ PANELS[#PANELS + 1] = {
         { title = "Zone", width = 230, justify = "LEFT",
           value = function(e) return e.zoneName or "" end },
         { title = "Affixes left", width = 92, justify = "RIGHT", numeric = true,
+          headerTooltip = "Total affixes still left to attune across every affixed item killable mobs drop in this zone.",
           value = function(e) return num(e.totalAffixesLeft) end },
         { title = "Items w/ left", width = 110, justify = "RIGHT", numeric = true,
+          headerTooltip = "Affixed items dropped here that still have at least one affix left to attune.",
           value = function(e) return num(e.affixedItemsWithAffixesLeft) end },
         { title = "Unattuned", width = 110, justify = "RIGHT", numeric = true,
+          headerTooltip = "Affixed items dropped here that you have not attuned at all yet.",
           value = function(e) return num(e.unattunedAffixedItems) end },
     },
     getRows = function(data)
@@ -363,11 +385,14 @@ PANELS[#PANELS + 1] = {
         { title = "Zone", width = 150, justify = "LEFT",
           value = function(e) return e.zoneName or "" end },
         { title = "Drops/1k", width = 76, justify = "RIGHT", numeric = true,
+          headerTooltip = "Expected useful affix drops per 1000 kills of this mob: drop chance x (affixes left / possible affixes), summed over the items it drops.",
           value = function(e) return num(e.evPerKill) * 1000 end,
           text = function(e) return string.format("%.2f", num(e.evPerKill) * 1000) end },
         { title = "Spawns", width = 64, justify = "RIGHT", numeric = true,
+          headerTooltip = "Reported spawn count for this mob -- higher means a denser pack to farm. The Min spawns box hides mobs below its value.",
           value = function(e) return num(e.spawnedCount) end },
         { title = "Items", width = 56, justify = "RIGHT", numeric = true,
+          headerTooltip = "Affixed items this mob drops that still have affixes left (a per-mob count -- nothing is summed across mobs).",
           value = function(e) return num(e.itemsDropped) end },
     },
     getRows = function(data, panel)
@@ -469,8 +494,29 @@ PANELS[#PANELS + 1] = {
             UI.RefreshActivePanel()
         end)
 
+        -- "Curr": filter to the zone the player is standing in right now.
+        local currBtn = CreateFrame("Button", nil, strip, "UIPanelButtonTemplate")
+        currBtn:SetSize(46, 18)
+        currBtn:SetPoint("LEFT", clearBtn, "RIGHT", 4, 0)
+        currBtn:SetText("Curr")
+        currBtn:SetScript("OnClick", function()
+            local zone = AF.GetCurrentZoneName()
+            zoneEdit:SetText(zone or "")
+            UI.filters.zone = (zone and zone ~= "") and zone or nil
+            zoneEdit:ClearFocus()
+            updatePlaceholder()
+            UI.RefreshActivePanel()
+        end)
+        currBtn:SetScript("OnEnter", function(s)
+            GameTooltip:SetOwner(s, "ANCHOR_TOP")
+            GameTooltip:AddLine("Filter to your current zone", 1, 1, 1)
+            GameTooltip:AddLine(AF.GetCurrentZoneName() or "?", 0.8, 0.8, 0.8)
+            GameTooltip:Show()
+        end)
+        currBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
         local spawnLabel = MakeText(strip, "OVERLAY", "GameFontNormalSmall")
-        spawnLabel:SetPoint("LEFT", clearBtn, "RIGHT", 18, 0)
+        spawnLabel:SetPoint("LEFT", currBtn, "RIGHT", 18, 0)
         spawnLabel:SetText("Min spawns:")
 
         local edit = CreateFrame("EditBox", nil, strip, "InputBoxTemplate")
@@ -519,10 +565,13 @@ PANELS[#PANELS + 1] = {
         { title = "Category", width = 226, justify = "LEFT",
           value = function(e) return e.category or "" end },
         { title = "Unattuned", width = 108, justify = "RIGHT", numeric = true,
+          headerTooltip = "Affixed items in this category, here, you have not attuned at all yet.",
           value = function(e) return num(e.unattuned) end },
         { title = "Items w/ left", width = 108, justify = "RIGHT", numeric = true,
+          headerTooltip = "Affixed items in this category that still have affixes left to attune.",
           value = function(e) return num(e.withLeft) end },
         { title = "Affixes left", width = 96, justify = "RIGHT", numeric = true,
+          headerTooltip = "Total affixes left to attune across this category in the current zone.",
           value = function(e) return num(e.affixesLeft) end },
     },
     getRows = function(data, panel)
@@ -589,10 +638,13 @@ PANELS[#PANELS + 1] = {
               return (AF.ClassColorCode(e.classToken) or "") .. (e.className or "") .. "|r"
           end },
         { title = "Affixes left", width = 100, justify = "RIGHT", numeric = true,
+          headerTooltip = "Total affixes the account can still attune on this class, summed over the zones passing the Source/Expansion filters.",
           value = function(e) return num(e.totalAffixesLeft) end },
         { title = "Items w/ left", width = 110, justify = "RIGHT", numeric = true,
+          headerTooltip = "Affixed items with affixes left that this class can use (classes overlap, so these don't partition the account total).",
           value = function(e) return num(e.affixedItemsWithAffixesLeft) end },
         { title = "Unattuned", width = 110, justify = "RIGHT", numeric = true,
+          headerTooltip = "Affixed items this class can use that are not yet attuned at all.",
           value = function(e) return num(e.unattunedAffixedItems) end },
     },
     getRows = function(data)
@@ -630,20 +682,27 @@ PANELS[#PANELS + 1] = {
     zoneField = "zoneName",  -- honour the display-time category/expansion filters
     element = "fire",        -- selected resist; the panel's control strip changes it
     minSpawns = 5,           -- display-time spawn threshold (like the Mobs panel)
+    -- Resist attunement is flat per forge and class-agnostic, so Forge/Bind/Class
+    -- can't change the ranking. The filter bar greys them out on this tab.
+    ignoresItemFilters = true,
     columns = {
         { title = "Zone", width = 206, justify = "LEFT",
           value = function(e) return e.zoneName or "" end },
         { title = "Resist/1k", width = 84, justify = "RIGHT", numeric = true,
+          headerTooltip = "Estimated resistance gained per 1000 kills of the zone's best mob. \"~\" because the amount is estimated from item level (base-forge attune).",
           value = function(e) return num(e.score) end,
           text = function(e) return string.format("~%.2f", num(e.score)) end },
         { title = "Best mob", width = 148, justify = "LEFT",
+          headerTooltip = "The single best mob to farm in this zone for the chosen resist (what the Resist/1k score is based on).",
           value = function(e) return e.bestMobName or "" end },
         { title = "Spawns", width = 60, justify = "RIGHT", numeric = true,
+          headerTooltip = "Reported spawn count of the best mob.",
           value = function(e) return num(e.bestMobSpawns) end },
         -- Items the BEST mob drops that still roll this resist unattuned (already
         -- resist-specific via the per-item gate). Can run opposite to the resist
         -- ranking: many low-resist items vs few high-resist ones.
         { title = "Items", width = 48, justify = "RIGHT", numeric = true,
+          headerTooltip = "Items the best mob drops that still roll this resist unattuned. Can run opposite to the score (many small-resist items vs few large ones).",
           value = function(e) return num(e.bestMobItems) end },
     },
     -- Custom data source + signature (consumed by UI.RequestData/SelectPanel).
@@ -652,6 +711,7 @@ PANELS[#PANELS + 1] = {
     end,
     dataSig = function(panel)
         return "resist:" .. UI.filters.scope .. ":" .. tostring(panel.element)
+            .. ":" .. (AF.GetConfig("includeMythics") and "m" or "n")
     end,
     scanLabel = function(panel)
         local info = AF.RESIST_ELEMENTS and AF.RESIST_ELEMENTS[panel.element]
@@ -662,21 +722,39 @@ PANELS[#PANELS + 1] = {
         -- what targeted resist farming actually does.
         return (AF.BuildZoneEV(data, "best", panel.minSpawns))
     end,
+    -- Each row is a zone, but it names the single best mob to farm there, so
+    -- clicking pins that mob exactly like the Mobs panel (BuildZoneEV carries its
+    -- npcId). Reuses AF.TryWarpToMob, so the t3 warp-assist setting applies too.
+    onRowClick = function(entry)
+        if not (AF.TryWarpToMob and entry.bestMobNpcId) then return end
+        AF.TryWarpToMob({
+            npcId = entry.bestMobNpcId,
+            npcName = entry.bestMobName,
+            zoneName = entry.zoneName,
+        })
+    end,
     summary = function(data, n, panel)
         local info = AF.RESIST_ELEMENTS and AF.RESIST_ELEMENTS[panel.element]
         local label = info and info.label or panel.element
+        local warpPart = AF.GetConfig("automaticWarp") and " -- click a zone to pin its best mob/open map" or " -- click a zone to pin its best mob"
         return string.format(
-            "%s resist: %d zones by ~%s resistance/1000 kills (%s; best mob; min spawns %d) -- estimated from item level; Forge/Bind don't apply",
-            label, n, label, UI.filters.scope, panel.minSpawns)
+            "%s resist: %d zones by ~%s resistance/1000 kills (%s; best mob; min spawns %d) -- estimated from item level; Forge/Bind don't apply%s",
+            label, n, label, UI.filters.scope, panel.minSpawns, warpPart)
     end,
     tooltip = function(e)
-        return {
+        local lines = {
             { left = e.zoneName, right = string.format("~%.2f resist / 1000 kills", num(e.score)) },
             { left = "  Best mob", right = tostring(e.bestMobName or "?") },
             { left = "  Reported spawn count", right = tostring(num(e.bestMobSpawns)) },
             { left = "  Items it drops with this resist (unattuned)", right = tostring(num(e.bestMobItems)) },
             { left = "  Estimate: 20% of base resist (base forge), from item level." },
         }
+        if AF.GetConfig("automaticWarp") then
+            lines[#lines + 1] = { left = "  Click", right = "pin the best mob and open t3 map" }
+        else
+            lines[#lines + 1] = { left = "  Click", right = "pin the best mob on the map" }
+        end
+        return lines
     end,
     buildControls = function(panel, strip)
         panel.minSpawns = AF.GetConfig("minSpawns")
@@ -972,6 +1050,8 @@ function UI.Build()
     UI.bindSeg = bindSeg
     UI.sourceSeg = sourceSeg
     UI.expSeg = expSeg
+    UI.forgeLabel = forgeLabel
+    UI.bindLabel = bindLabel
 
     -- Tab buttons (one per panel)
     UI.tabButtons = {}
@@ -1024,10 +1104,21 @@ function UI.Build()
         arrow:Hide()
         hb.arrow = arrow
         hb:SetScript("OnClick", function() UI.ToggleSort(i) end)
-        hb:SetScript("OnEnter", function(s) s.label:SetTextColor(1, 1, 1) end)
+        hb:SetScript("OnEnter", function(s)
+            s.label:SetTextColor(1, 1, 1)
+            local col = ActivePanel().columns[s.colIndex]
+            if col and col.headerTooltip then
+                GameTooltip:SetOwner(s, "ANCHOR_TOP")
+                GameTooltip:AddLine(col.title, 1, 1, 1)
+                GameTooltip:AddLine(col.headerTooltip, 0.85, 0.85, 0.85, true)
+                GameTooltip:AddLine("Click to sort.", 0.6, 0.6, 0.6)
+                GameTooltip:Show()
+            end
+        end)
         hb:SetScript("OnLeave", function(s)
             local c = NORMAL_FONT_COLOR
             s.label:SetTextColor(c.r, c.g, c.b)
+            GameTooltip:Hide()
         end)
         UI.headerButtons[i] = hb
     end
@@ -1134,6 +1225,8 @@ function UI.Build()
 
     -- Refresh while shown so attune/cache changes propagate.
     f:RegisterEvent("CHAT_MSG_SYSTEM")
+    -- Keep the Current Zone panel pointed at where the player actually is.
+    f:RegisterEvent("ZONE_CHANGED_NEW_AREA")
     f:SetScript("OnEvent", function(_, event, arg1)
         if event == "CHAT_MSG_SYSTEM" and type(arg1) == "string"
             and string.find(arg1, "You have attuned with", 1, true) then
@@ -1141,6 +1234,12 @@ function UI.Build()
             UI.data = nil
             if f:IsShown() then
                 UI.RequestData()
+            end
+        elseif event == "ZONE_CHANGED_NEW_AREA" then
+            -- The Current Zone panel reads the live zone each render; the data
+            -- already covers every zone, so just re-render it (no rescan).
+            if f:IsShown() and UI.data and ActivePanel().id == "current" then
+                UI.RefreshActivePanel()
             end
         end
     end)
@@ -1167,6 +1266,40 @@ function UI.UpdateClassControl()
         UIDropDownMenu_SetText(UI.classDD, UI.classAllLabel)
         UI.classLabel:Hide()
         UI.classDD:Hide()
+    end
+    UI.UpdateFilterControlState()
+end
+
+local LABEL_ENABLED_COLOR = NORMAL_FONT_COLOR or { r = 1, g = 0.82, b = 0 }
+local LABEL_DISABLED_COLOR = GRAY_FONT_COLOR or { r = 0.5, g = 0.5, b = 0.5 }
+
+local function setLabelEnabled(label, enabled)
+    if not label then return end
+    local c = enabled and LABEL_ENABLED_COLOR or LABEL_DISABLED_COLOR
+    label:SetTextColor(c.r, c.g, c.b)
+end
+
+-- Grey out the filters the active panel ignores (Forge/Bind/Class on the Resist
+-- tab) so the bar tells the truth about what applies. Class is only ever shown
+-- in Account scope, so it is left to UI.UpdateClassControl to show/hide; here we
+-- just enable/disable whatever is currently shown.
+function UI.UpdateFilterControlState()
+    if not UI.forgeSeg then return end
+    local panel = PANELS[UI.activePanelIndex]
+    local itemFiltersApply = not (panel and panel.ignoresItemFilters)
+
+    UI.forgeSeg:SetEnabled(itemFiltersApply)
+    UI.bindSeg:SetEnabled(itemFiltersApply)
+    setLabelEnabled(UI.forgeLabel, itemFiltersApply)
+    setLabelEnabled(UI.bindLabel, itemFiltersApply)
+
+    if UI.classDD then
+        if itemFiltersApply then
+            UIDropDownMenu_EnableDropDown(UI.classDD)
+        else
+            UIDropDownMenu_DisableDropDown(UI.classDD)
+        end
+        setLabelEnabled(UI.classLabel, itemFiltersApply)
     end
 end
 
@@ -1198,6 +1331,9 @@ function UI.SelectPanel(index, skipRequest)
         panel._controlFrame:Show()
         if panel.syncControls then panel.syncControls(panel) end
     end
+
+    -- Grey out filters this panel ignores (e.g. Forge/Bind/Class on Resist).
+    UI.UpdateFilterControlState()
 
     -- Lay out column headers for this panel.
     for i, hb in ipairs(UI.headerButtons) do
@@ -1429,10 +1565,23 @@ function UI.RefreshActivePanel()
         UI.summaryText:SetText("")
     end
 
-    -- Footer status.
+    -- Footer status. A slice goes "dirty" when you attune something; the core
+    -- keeps serving it (rate-limited by the rescan interval) rather than
+    -- rescanning on every attune, so surface that instead of a flat "cached".
     local scanned = UI.dataItemsScanned or 0
-    UI.statusText:SetText(string.format("%d rows  |  %d affixed items with mob sources  |  cached",
-        #entries, scanned))
+    local cacheState = "cached"
+    if UI.data.dirty then
+        local interval = (tonumber(AF.GetConfig("rescanInterval")) or 0) * 60
+        local remaining = interval - (time() - (UI.data.computedAt or 0))
+        if interval > 0 and remaining > 0 then
+            cacheState = string.format("stale -- auto-refresh in ~%dm (or Rescan)",
+                math.max(1, math.ceil(remaining / 60)))
+        else
+            cacheState = "stale -- Rescan to refresh"
+        end
+    end
+    UI.statusText:SetText(string.format("%d rows  |  %d affixed items with mob sources  |  %s",
+        #entries, scanned, cacheState))
 
     if #entries == 0 then
         UI.SetOverlay("Nothing to show for these filters.")

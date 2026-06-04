@@ -100,10 +100,15 @@ function AF.ClearDynamicData()
 end
 
 -- Full reset: also re-discover the affixed-item list (use after a data reload).
+-- Drops the cross-session persisted id list too, so a server data reload that
+-- left MAX_ITEMID unchanged (fingerprint still "matching") is forced to rescan.
 function AF.ClearAll()
     AF.affixedItemIds = nil
     AF.zoneData = {}
     AF.resistData = {}
+    if type(_G.AffixFinderDB) == "table" then
+        _G.AffixFinderDB.affixCache = nil
+    end
 end
 
 local function safeCall(fn, ...)
@@ -318,7 +323,7 @@ end
 -- pure casters.
 --
 -- *** The tables below are the single place to fix a wrong proficiency. ***
--- Cell most worth an in-game spot-check: WEAPON_CLASSES.thrown (Hunter?).
+-- (WEAPON_CLASSES.thrown including Hunter is confirmed correct in-game.)
 
 AF.CLASS_ORDER = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST",
                    "DEATHKNIGHT", "SHAMAN", "MAGE", "WARLOCK", "DRUID" }
@@ -498,9 +503,21 @@ end
 -- ---------------------------------------------------------------------------
 -- Mob map-pin / t3 warp-assist helper
 -- ---------------------------------------------------------------------------
--- Clicking a mob in the UI always places one latest-target pin. The optional
--- t3 helper only opens the resolved zone map; the player still performs the
--- in-game t3 click-to-warp action manually.
+-- Clicking a mob in the UI places one latest-target marker. The primary marker
+-- is SERVER-SIDE tracking by npcId (Custom_AddTrackObjLoc, OBJTYPE_CREATURE):
+-- the WoWExt server knows every creature's spawn points and renders the marker
+-- on the world map + minimap itself, so it needs NO coordinate data and NO
+-- Questie -- this is the path that always works (qtRunner uses the same API for
+-- its quest/NPC tracking). Questie, when present, is an optional enhancement: it
+-- supplies exact spawn coordinates for a precise manual pin and exact map
+-- positioning. There is no server itemId/npcId -> coordinate API on this client,
+-- so Questie is the only source of explicit coordinates. The optional t3 helper
+-- opens the zone map (exact spot via Questie, else zoomed to the zone by name)
+-- ONLY when the map click can actually take the player there: it is skipped for
+-- dungeons/raids (no zone warps exist for instance content) and opens only when
+-- hasZoneT3Warp confirms the player has the zone's T3 "click-anywhere" warp (a
+-- T1/T2 warp can't reach the marked spot; a nil "can't tell" result also does not
+-- open). The player still performs the in-game T3 click-to-warp action manually.
 
 local function normLookupText(value)
     value = string.lower(tostring(value or ""))
@@ -701,48 +718,123 @@ function AF.ResolveMobWarpTarget(entry)
     return target
 end
 
-local function hasZoneWarp(target)
+-- Synastria zone warps come in three tiers, by how many times you unlocked the
+-- zone's warp: T1 (1x) = fixed drop point, T2 / "warp mastery" (2x) = you set the
+-- point, T3 / "warp attunement" (3x) = click ANYWHERE on the map to land there.
+-- Only T3 makes opening the map useful, so the warp assist gates on T3, not on
+-- merely owning a warp.
+local REQUIRED_WARP_TIER = 3
+
+-- zoneName -> warp spell index (0-based) passed to CustomHasTeleport. There is no
+-- server API to map a zone name to its warp index, so we bundle the mapping
+-- ourselves rather than depend on another addon being installed. (A loaded
+-- qtRunner ships the same table in qtRunnerData.spells and is used only as an
+-- optional supplement below, in case the server adds warps before this snapshot
+-- is refreshed.) Indices are server-defined and stable; refresh if the server's
+-- warp list changes.
+local WARP_ZONE_INDEX = {
+    ["Isle of Quel'Danas"] = 0, ["Eversong Woods"] = 1, ["Ghostlands"] = 2,
+    ["Eastern Plaguelands"] = 3, ["Western Plaguelands"] = 4, ["Tirisfal Glades"] = 5,
+    ["Undercity"] = 6, ["Silverpine Forest"] = 7, ["Alterac Mountains"] = 8,
+    ["Hillsbrad Foothills"] = 9, ["The Hinterlands"] = 10, ["Arathi Highlands"] = 11,
+    ["Wetlands"] = 12, ["Loch Modan"] = 13, ["Ironforge"] = 14, ["Dun Morogh"] = 15,
+    ["Badlands"] = 16, ["Searing Gorge"] = 17, ["Burning Steppes"] = 18,
+    ["Redridge Mountains"] = 19, ["Elwynn Forest"] = 20, ["Stormwind City"] = 21,
+    ["Westfall"] = 22, ["Duskwood"] = 23, ["Deadwind Pass"] = 24,
+    ["Swamp of Sorrows"] = 25, ["Blasted Lands"] = 26, ["Stranglethorn Vale"] = 27,
+    ["Silvermoon City"] = 28, ["Silithus"] = 29, ["Un'Goro Crater"] = 30,
+    ["Tanaris"] = 31, ["Thousand Needles"] = 32, ["Feralas"] = 33, ["Desolace"] = 34,
+    ["Mulgore"] = 35, ["Thunder Bluff"] = 36, ["The Barrens"] = 37,
+    ["Dustwallow Marsh"] = 38, ["Stonetalon Mountains"] = 39, ["Durotar"] = 40,
+    ["Orgrimmar"] = 41, ["Ashenvale"] = 42, ["Azshara"] = 43, ["Winterspring"] = 44,
+    ["Felwood"] = 45, ["Darkshore"] = 46, ["Moonglade"] = 47, ["Teldrassil"] = 48,
+    ["Darnassus"] = 49, ["Azuremyst Isle"] = 50, ["The Exodar"] = 51,
+    ["Bloodmyst Isle"] = 52, ["Hellfire Peninsula"] = 53, ["Zangarmarsh"] = 54,
+    ["Nagrand"] = 55, ["Terokkar Forest"] = 56, ["Shadowmoon Valley"] = 57,
+    ["Blade's Edge Mountains"] = 58, ["Netherstorm"] = 59, ["Shattrath City"] = 60,
+    ["Howling Fjord"] = 61, ["Grizzly Hills"] = 62, ["Zul'Drak"] = 63,
+    ["The Storm Peaks"] = 64, ["Crystalsong Forest"] = 65, ["Dalaran"] = 66,
+    ["Icecrown"] = 67, ["Dragonblight"] = 68, ["Wintergrasp"] = 69,
+    ["Sholazar Basin"] = 70, ["Borean Tundra"] = 71,
+}
+
+-- Lazily-built normalized (case/punctuation-insensitive) index over the bundled
+-- table, so loot-data zone names that differ only in punctuation still match.
+local warpIndexByNormKey
+
+local function bundledWarpIndex(zoneName)
+    local idx = WARP_ZONE_INDEX[zoneName]
+    if idx ~= nil then
+        return idx
+    end
+    if not warpIndexByNormKey then
+        warpIndexByNormKey = {}
+        for name, index in pairs(WARP_ZONE_INDEX) do
+            warpIndexByNormKey[normLookupText(name)] = index
+        end
+    end
+    return warpIndexByNormKey[normLookupText(zoneName)]
+end
+
+-- Optional supplement: a loaded qtRunner's (possibly newer) zone->index table.
+local function qtRunnerWarpIndex(zoneName)
     local qtData = _G.qtRunnerData
     local spells = type(qtData) == "table" and qtData.spells
-    local warpIndex = type(spells) == "table" and spells[target.zoneName]
-    if not warpIndex and type(spells) == "table" then
-        local wanted = normLookupText(target.zoneName)
-        for zoneName, index in pairs(spells) do
-            if normLookupText(zoneName) == wanted then
-                warpIndex = index
-                break
-            end
+    if type(spells) ~= "table" then
+        return nil
+    end
+    local idx = spells[zoneName]
+    if idx ~= nil then
+        return idx
+    end
+    local wanted = normLookupText(zoneName)
+    for name, index in pairs(spells) do
+        if normLookupText(name) == wanted then
+            return index
         end
     end
-    if warpIndex and type(_G.CustomHasTeleport) == "function" then
-        local ok, value = safeCall(_G.CustomHasTeleport, warpIndex)
-        if ok then
-            return (tonumber(value) or 0) > 0, "CustomHasTeleport", warpIndex
-        end
-    end
+    return nil
+end
 
-    local checks = {
-        "CustomCanTeleportName",
-        "CanCustomTeleportName",
-        "CustomHasTeleportName",
-        "CustomTeleportNameKnown",
-        "CustomHasWarpAttunement",
-        "CustomHasZoneWarp",
-    }
-    for _, name in ipairs(checks) do
-        local fn = _G[name]
-        if type(fn) == "function" then
-            local ok, value = safeCall(fn, target.zoneName or target.zoneId)
-            if ok and value ~= nil then
-                return value and value ~= 0, name
-            end
-            ok, value = safeCall(fn, target.zoneId or target.zoneName)
-            if ok and value ~= nil then
-                return value and value ~= 0, name
-            end
-        end
+-- The zone's warp index from our bundled table, falling back to a loaded
+-- qtRunner's table for anything we don't have. nil = the zone has no zone warp.
+local function resolveWarpIndex(zoneName)
+    if type(zoneName) ~= "string" or zoneName == "" then
+        return nil
     end
-    return nil, nil
+    local idx = bundledWarpIndex(zoneName)
+    if idx ~= nil then
+        return idx
+    end
+    return qtRunnerWarpIndex(zoneName)
+end
+
+-- The raw warp tier the server reports for a zone, or nil if it can't be read
+-- (no warp index, or no CustomHasTeleport). CustomHasTeleport(index) returns the
+-- unlock count / tier: 0 none, 1 T1 (fixed point), 2 T2 (mastery), 3 T3
+-- (attunement) -- confirmed in-game via `/af warp`. Returns (tier, warpIndex).
+local function zoneWarpTier(zoneName)
+    local warpIndex = resolveWarpIndex(zoneName)
+    if warpIndex == nil or type(_G.CustomHasTeleport) ~= "function" then
+        return nil, warpIndex
+    end
+    local ok, value = safeCall(_G.CustomHasTeleport, warpIndex)
+    if not ok then
+        return nil, warpIndex
+    end
+    return tonumber(value), warpIndex
+end
+
+-- Does the player have the T3 (click-anywhere) warp for this zone?
+--   true  : tier >= 3 -- opening the map to a spot is useful
+--   false : a lower tier (T1/T2) or none -- opening the map would not help
+--   nil   : can't determine (no warp data / API) -- treat as "don't open"
+local function hasZoneT3Warp(zoneName)
+    local tier = zoneWarpTier(zoneName)
+    if tier == nil then
+        return nil
+    end
+    return tier >= REQUIRED_WARP_TIER
 end
 
 local function setTrackedMobTarget(target)
@@ -880,57 +972,117 @@ local function drawQuestieWarpPin(target)
     return ok and true or false
 end
 
-local function markMobTarget(target)
-    local tracked = setTrackedMobTarget(target)
-    local pinned = drawQuestieWarpPin(target)
-    local mode = pinned and "map pin" or (tracked and "tracked mob" or "resolved target")
-    return pinned or tracked, mode
+-- Places the map/minimap marker for a mob. Two independent layers:
+--   1. Server tracking (setTrackedMobTarget): needs only the npcId; the WoWExt
+--      server knows the creature's spawn points and renders the marker itself.
+--      This is the SAME mechanism qtRunner uses (Custom_AddTrackObjLoc with
+--      OBJTYPE_CREATURE) and works with NO coordinate data and NO Questie.
+--   2. A precise manual pin (drawQuestieWarpPin): a nicer pin at the exact spawn,
+--      but it needs resolved coordinates -- i.e. Questie (or a server coord API,
+--      which this client does not expose). Optional enhancement only.
+-- `entry` carries npcId/npcName/zoneName; `target` is the resolved-coords table
+-- (may be nil). markMode describes what was actually placed.
+local function markMobTarget(entry, target)
+    local tracked = setTrackedMobTarget(entry)
+    local pinned = target and drawQuestieWarpPin(target) or false
+    local mode
+    if pinned then
+        mode = tracked and "map pin + server tracker" or "map pin"
+    elseif tracked then
+        mode = "server tracker"
+    else
+        mode = "no map marker available"
+    end
+    return (pinned or tracked), mode
 end
 
-local function openWarpAssistMap(target)
-    if openMapWithQuestie(target) or openMapByZoneName(target.zoneName) then
+-- Opens the world map to the target. Prefers Questie's exact uiMap positioning
+-- when coordinates were resolved, but always falls back to zooming the Blizzard
+-- world map to the zone by name (no Questie needed) so warp assist still works.
+local function openWarpAssistMap(target, zoneName)
+    if target and openMapWithQuestie(target) then
+        return true
+    end
+    if openMapByZoneName(zoneName or (target and target.zoneName)) then
         return true
     end
     return false, "could not open the world map to the target zone"
 end
 
+-- A "Zone 12.3, 45.6" / "Zone" location suffix for chat, depending on whether
+-- precise coordinates were available.
+local function locationText(zoneName, target)
+    if target and target.x and target.y then
+        return string.format("%s %.1f, %.1f", tostring(zoneName or "?"), target.x, target.y)
+    end
+    return tostring(zoneName or "?")
+end
+
 function AF.TryWarpToMob(entry)
-    local target, err = AF.ResolveMobWarpTarget(entry)
-    if not target then
-        chat("Mob pin: " .. tostring(err))
-        return false, err
+    if type(entry) ~= "table" or not entry.npcId then
+        chat("Mob pin: missing NPC id.")
+        return false, "missing NPC id"
     end
 
-    local marked, markMode = markMobTarget(target)
-    local markText = marked and tostring(markMode or "map pin") or "coordinates only"
+    -- Optional: resolve precise coordinates (server coord API, else Questie). When
+    -- this fails (e.g. no Questie), we still place the server's own tracker below.
+    local target = AF.ResolveMobWarpTarget(entry)
+    -- Classify and look up the warp against the AUTHORITATIVE loot-data zone
+    -- (entry.zoneName) -- the same name the rankings/marker use. Questie's
+    -- target.zoneName is derived from a spawn areaId in a different id space than
+    -- WoWExt's zones, so it can resolve to a wrong/sub-zone name (e.g. a world zone
+    -- read as a dungeon, which wrongly tripped the "no warp into a dungeon" path).
+    -- target is used only for the precise pin + coordinates.
+    local zoneName = entry.zoneName or (target and target.zoneName)
+    -- Keep the pin's own label on the authoritative zone too (it only affects the
+    -- pin tooltip; placement still uses target.zoneId/x/y).
+    if target then
+        target.zoneName = zoneName
+    end
+
+    local marked, markMode = markMobTarget(entry, target)
+    local locText = locationText(zoneName, target)
+    local mobName = tostring(entry.npcName or "mob")
+
+    if not marked then
+        chat(string.format("Mob pin failed: %s @ %s.", mobName, locText))
+        return false, "could not mark"
+    end
 
     if not AF.GetConfig("automaticWarp") then
-        chat(string.format("Mob pin: marked %s @ %s %.1f, %.1f (%s).",
-            tostring(target.npcName or "mob"), tostring(target.zoneName or "?"),
-            target.x, target.y, markText))
+        chat(string.format("Mob pin: %s @ %s.", mobName, locText))
         return true, { target = target, marked = marked }
     end
 
-    local attuned, attuneSource = hasZoneWarp(target)
-    if attuned == false then
-        chat(string.format("Mob pin: marked %s @ %s %.1f, %.1f (%s), but no t3 warp attunement for this zone.",
-            tostring(target.npcName or "mob"), tostring(target.zoneName or entry.zoneName or "?"),
-            target.x, target.y, markText))
-        return true, { target = target, marked = marked, opened = false, reason = "not attuned" }
+    -- T3 warp assist (opt-in). There are no zone warps INTO dungeons/raids, so for
+    -- instance content we never open the map -- the marker is still placed so the
+    -- player can find the mob once they walk in manually.
+    local category = AF.ClassifyZone(zoneName)
+    if category == "dungeon" or category == "raid" then
+        chat(string.format("Mob pin: %s @ %s.", mobName, locText))
+        return true, { target = target, marked = marked, opened = false, reason = "instance" }
     end
 
-    local opened, openErr = openWarpAssistMap(target)
+    -- Only open the map when we can CONFIRM the player has this zone's T3 (click-
+    -- anywhere) warp -- a T1/T2 warp can't drop you on the marked spot, so opening
+    -- the map wouldn't help. This keeps the assistant useful for players with a
+    -- partial set of T3 warps: it opens for the zones they can T3 to and stays
+    -- quiet for the rest. A nil result (warp data unavailable) -> don't open.
+    local hasT3 = hasZoneT3Warp(zoneName)
+    if not hasT3 then
+        local why = (hasT3 == false) and "you don't have the T3 (click-anywhere) warp for this zone"
+            or "could not confirm a T3 warp for this zone"
+        chat(string.format("Mob pin: %s @ %s.", mobName, locText))
+        return true, { target = target, marked = marked, opened = false, reason = why }
+    end
+
+    local opened, openErr = openWarpAssistMap(target, zoneName)
     if opened then
-        local verify = attuneSource and ("; attunement via " .. attuneSource) or "; attunement check unavailable"
-        chat(string.format("Warp assist: marked %s and opened %s @ %.1f, %.1f (%s%s). Click the marked spot on the map to t3 warp.",
-            tostring(target.npcName or "mob"), tostring(target.zoneName or "?"),
-            target.x, target.y, markText, verify))
+        chat(string.format("Mob pin: %s @ %s.", mobName, locText))
         return true, { target = target, marked = marked, opened = true }
     end
 
-    chat(string.format("Mob pin: marked %s @ %s %.1f, %.1f (%s), but %s.",
-        tostring(target.npcName or "mob"), tostring(target.zoneName or "?"),
-        target.x, target.y, markText, tostring(openErr)))
+    chat(string.format("Mob pin: %s @ %s.", mobName, locText))
     return true, { target = target, marked = marked, opened = false, reason = openErr }
 end
 
@@ -1208,9 +1360,9 @@ local function affixedItemValue(itemId, scope, forgeFilter, bindFilter, includeM
     if not includeMythics and itemIsMythic(itemId) then
         return nil
     end
-    if not itemHasRandomAffix(itemId) then
-        return nil
-    end
+    -- No itemHasRandomAffix gate here: this is only ever called over
+    -- AF.affixedItemIds (every id is already known affixed), and getAffixCounts
+    -- below returns possible <= 0 for anything without a usable affix mask.
     local possible, left = getAffixCounts(itemId, forgeFilter)
     if possible <= 0 then
         return nil
@@ -1247,7 +1399,7 @@ end
 -- counted only while the item can still roll the resist and has not attuned it.
 --
 -- Resist school stat-type ids and the mask-bit == ItemAttuneAffix.index mapping
--- are confirmed in-game; see synastria_api.md.
+-- are confirmed in-game.
 AF.RESIST_ELEMENTS = {
     fire   = { label = "Fire",   statType = 51 },
     nature = { label = "Nature", statType = 52 },
@@ -1372,8 +1524,15 @@ end
 --   = (1 / possibleAffixCount) * (20% * estimatedBaseResist(itemLevel))
 -- resistGain is the per-attune resist (for display); itemLevel is carried so the
 -- caller can show what drove the estimate.
-local function affixedResistValue(itemId, scope, elementIndex)
+local function affixedResistValue(itemId, scope, elementIndex, includeMythics)
     if not itemMatchesScope(itemId, scope) then
+        return nil
+    end
+    -- Honour the mythic setting for consistency with the affix views. (In
+    -- practice mythic items drop only from mythic dungeons and aren't expected
+    -- to carry resist affixes, so this rarely changes the ranking -- but the
+    -- behaviour should match the rest of the addon rather than silently differ.)
+    if not includeMythics and itemIsMythic(itemId) then
         return nil
     end
     local tok, _, tags2 = safeCall(GetItemTagsCustom, itemId)
@@ -1444,6 +1603,9 @@ local function runChunked(total, stepFn, doneFn, progressFn, budgetMs, perFrameC
         end
         if i >= total then
             self:SetScript("OnUpdate", nil)
+            if progressFn then
+                progressFn(total, total)
+            end
             doneFn()
         end
     end)
@@ -1461,18 +1623,68 @@ local function endTask()
     AF.busy = false
 end
 
--- Fresh progress callback that prints only on new 10% milestones.
-local function makeProgress(label)
-    local lastDecile = -1
-    return function(done, total)
-        if not total or total <= 0 then
+-- Shared cache + staleness + busy-guard wrapper for the compute functions.
+--   store    : the cache table (AF.zoneData or AF.resistData)
+--   key      : cache key string
+--   build    : build(finish) runs the (chunked) scan and calls finish(data) with
+--              the freshly built slice (or finish(nil, err) on failure). finish
+--              stamps computedAt/dirty and stores the slice, then releases the
+--              busy guard and forwards to onComplete.
+--   onComplete(data) / onComplete(nil, err)
+--
+-- A non-dirty cached slice is returned immediately; a dirty one is reused until
+-- the configured rescanInterval has elapsed since it was built (0 = always
+-- recompute), then dropped and rebuilt. A manual ClearAll removes the entry,
+-- bypassing the interval. This is the one place that policy lives.
+local function computeWithCache(store, key, build, onComplete)
+    onComplete = onComplete or function() end
+
+    local cached = store[key]
+    if cached then
+        if not cached.dirty then
+            onComplete(cached)
             return
         end
-        local pct = math.floor((done / total) * 100)
-        local decile = pct - (pct % 10)
-        if decile > lastDecile then
-            lastDecile = decile
-            chat(string.format("%s... %d%%", label, decile))
+        local interval = (tonumber(AF.GetConfig("rescanInterval")) or 0) * 60
+        if interval > 0 and (time() - (cached.computedAt or 0)) < interval then
+            onComplete(cached)
+            return
+        end
+        store[key] = nil
+    end
+
+    if not beginTask() then
+        onComplete(nil, "busy")
+        return
+    end
+
+    local function finish(data, err)
+        endTask()
+        if data then
+            data.computedAt = time()
+            data.dirty = false
+            store[key] = data
+        end
+        onComplete(data, err)
+    end
+
+    build(finish)
+end
+
+local function makeProgress(label)
+    local halfPrinted = false
+    local finished = false
+    chat("Scan " .. tostring(label) .. " started.")
+    return function(done, total)
+        total = tonumber(total) or 0
+        done = tonumber(done) or 0
+        if total > 0 and not halfPrinted and done >= (total / 2) then
+            halfPrinted = true
+            chat("Scan " .. tostring(label) .. " at 50%.")
+        end
+        if total > 0 and not finished and done >= total then
+            finished = true
+            chat("Scan " .. tostring(label) .. " finished.")
         end
     end
 end
@@ -1484,6 +1696,31 @@ end
 -- Finds (once per session) the item ids that have a random affix. This is the
 -- only pass that touches the whole id space; it is static so later commands
 -- reuse it. Calls onReady(ids) or onReady(nil, errorText).
+-- The affixed-id list is static for a given server-data version, so it is
+-- cached across sessions in AffixFinderDB.affixCache, fingerprinted by
+-- MAX_ITEMID. This skips the (only) whole-id-space pass on every session after
+-- the first. It is a list of integers (not the item graph), so it has none of
+-- the memory/logout cost the graph would. AF.ClearAll() wipes it for the rare
+-- server-data-reload case (where MAX_ITEMID may not have changed).
+local function loadPersistedAffixIds()
+    local db = _G.AffixFinderDB
+    local cache = type(db) == "table" and db.affixCache
+    if type(cache) == "table" and cache.max == MAX_ITEMID and type(cache.ids) == "table" then
+        return cache.ids
+    end
+    return nil
+end
+
+local function persistAffixIds(ids)
+    local db = _G.AffixFinderDB
+    if type(db) ~= "table" then
+        db = {}
+        _G.AffixFinderDB = db
+    end
+    -- Store the same reference (static, never mutated) so there is no copy cost.
+    db.affixCache = { max = MAX_ITEMID, ids = ids }
+end
+
 local function ensureAffixedIds(onReady)
     local ready, reason = isCustomReady()
     if not ready then
@@ -1499,14 +1736,24 @@ local function ensureAffixedIds(onReady)
         return
     end
 
+    -- Reuse the persisted list when its fingerprint still matches, skipping the
+    -- whole-id-space scan entirely.
+    local persisted = loadPersistedAffixIds()
+    if persisted then
+        AF.affixedItemIds = persisted
+        onReady(persisted)
+        return
+    end
+
     local ids = {}
-    local progress = makeProgress("Finding affixed items")
+    local progress = makeProgress("affixed items")
     runChunked(MAX_ITEMID, function(itemId)
         if itemHasRandomAffix(itemId) then
             ids[#ids + 1] = itemId
         end
     end, function()
         AF.affixedItemIds = ids
+        persistAffixIds(ids)
         onReady(ids)
     end, progress)
 end
@@ -1561,34 +1808,7 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
     local includeMythics = AF.GetConfig("includeMythics") and true or false
     local key = scopeForgeKey(scope, forgeFilter, bindFilter, includeMythics)
 
-    local cached = AF.zoneData[key]
-    if cached then
-        if not cached.dirty then
-            onComplete(cached)
-            return
-        end
-        -- Stale (the player attuned something since this slice was built).
-        -- Rate-limit automatic rescans: only recompute once the configured
-        -- interval has elapsed since the last build; otherwise keep serving the
-        -- slightly-stale cache. interval 0 = recompute on the next request.
-        -- A manual rescan (AF.ClearAll) bypasses this by removing the entry.
-        local interval = (tonumber(AF.GetConfig("rescanInterval")) or 0) * 60
-        if interval > 0 and (time() - (cached.computedAt or 0)) < interval then
-            onComplete(cached)
-            return
-        end
-        AF.zoneData[key] = nil
-    end
-
-    if not beginTask() then
-        onComplete(nil, "busy")
-        return
-    end
-    local function finish(data, err)
-        endTask()
-        onComplete(data, err)
-    end
-
+    computeWithCache(AF.zoneData, key, function(finish)
     ensureAffixedIds(function(ids, err)
         if not ids then
             finish(nil, err)
@@ -1599,7 +1819,7 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
         local rows = {}
         local mobsByKey = {}
         local affixedItemsScanned = 0
-        local progress = makeProgress("Scanning mob sources")
+        local progress = makeProgress("mob sources")
         -- Per-class breakdown only matters in account scope (character scope is
         -- already a single class); skip the work otherwise.
         local perClass = (scope == "account")
@@ -1713,7 +1933,7 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
                 end
             end
         end, function()
-            local data = {
+            finish({
                 scope = scope,
                 forgeFilter = forgeFilter,
                 bindFilter = bindFilter,
@@ -1722,13 +1942,10 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
                 rowsByZone = rowsByZone,
                 mobsByKey = mobsByKey,
                 affixedItemsScanned = affixedItemsScanned,
-                computedAt = time(),
-                dirty = false,
-            }
-            AF.zoneData[key] = data
-            finish(data)
+            })
         end, progress)
     end)
+    end, onComplete)
 end
 
 -- Builds (and memory-caches) the per-zone/per-mob data for one resist element,
@@ -1751,30 +1968,11 @@ function AF.ComputeResistData(scope, element, onComplete)
         return
     end
 
+    local includeMythics = AF.GetConfig("includeMythics") and true or false
     local key = tostring(scope) .. ":" .. tostring(element)
-    local cached = AF.resistData[key]
-    if cached then
-        if not cached.dirty then
-            onComplete(cached)
-            return
-        end
-        local interval = (tonumber(AF.GetConfig("rescanInterval")) or 0) * 60
-        if interval > 0 and (time() - (cached.computedAt or 0)) < interval then
-            onComplete(cached)
-            return
-        end
-        AF.resistData[key] = nil
-    end
+        .. ":" .. (includeMythics and "myth" or "nomyth")
 
-    if not beginTask() then
-        onComplete(nil, "busy")
-        return
-    end
-    local function finish(data, err)
-        endTask()
-        onComplete(data, err)
-    end
-
+    computeWithCache(AF.resistData, key, function(finish)
     ensureAffixedIds(function(ids, err)
         if not ids then
             finish(nil, err)
@@ -1785,11 +1983,11 @@ function AF.ComputeResistData(scope, element, onComplete)
         local rows = {}
         local mobsByKey = {}
         local itemsScanned = 0
-        local progress = makeProgress("Scanning " .. element .. " resist sources")
+        local progress = makeProgress(element .. " resist sources")
 
         runChunked(#ids, function(i)
             local itemId = ids[i]
-            local value = affixedResistValue(itemId, scope, elementIndex)
+            local value = affixedResistValue(itemId, scope, elementIndex, includeMythics)
             if not value then
                 return
             end
@@ -1842,20 +2040,18 @@ function AF.ComputeResistData(scope, element, onComplete)
                 end
             end
         end, function()
-            local data = {
+            finish({
                 scope = scope,
                 element = element,
+                includeMythics = includeMythics,
                 rows = rows,
                 rowsByZone = rowsByZone,
                 mobsByKey = mobsByKey,
                 affixedItemsScanned = itemsScanned,
-                computedAt = time(),
-                dirty = false,
-            }
-            AF.resistData[key] = data
-            finish(data)
+            })
         end, progress)
     end)
+    end, onComplete)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1901,6 +2097,14 @@ end
 local function bindLabelText(bindFilter)
     local label = AF.BindLabel(bindFilter)
     return label and (", " .. label) or ""
+end
+
+-- "scope, TF+, BoE" -- the scope/forge/bind portion every chat caption opens
+-- with. The callers wrap this with view-specific context (zone name, counts).
+local function filterCaption(scope, forgeFilter, bindFilter)
+    return scope
+        .. (forgeFilter and (", " .. forgeFilter.label) or "")
+        .. bindLabelText(bindFilter)
 end
 
 -- ---------------------------------------------------------------------------
@@ -2055,6 +2259,20 @@ end
 -- GetLFGDungeonInfo expansionLevel -> our expansion key.
 local LFG_EXPANSION = { [0] = "classic", [1] = "tbc", [2] = "wotlk" }
 
+-- Expansion for a bundled warp-zone index (see WARP_ZONE_INDEX). TBC: Quel'Danas
+-- /Eversong/Ghostlands (0-2), Silvermoon (28), Draenei isles + Exodar (50-52),
+-- Outland (53-60). WotLK: all Northrend (61-71). Everything else is classic.
+local TBC_WARP_INDICES = {
+    [0] = true, [1] = true, [2] = true, [28] = true,
+    [50] = true, [51] = true, [52] = true, [53] = true, [54] = true,
+    [55] = true, [56] = true, [57] = true, [58] = true, [59] = true, [60] = true,
+}
+local function warpZoneExpansion(index)
+    if TBC_WARP_INDICES[index] then return "tbc" end
+    if index >= 61 then return "wotlk" end
+    return "classic"
+end
+
 local function buildZoneClassification()
     local map = {}
 
@@ -2089,17 +2307,26 @@ local function buildZoneClassification()
         end
     end
 
-    -- Battlegrounds / continent names the loot data uses but the map omits.
+    -- Battlegrounds / continent names the loot data uses but the map omits. These
+    -- are curated open-world names, so (like the continent map below) they override
+    -- any instance classification for the same key from the custom-server LFG pass.
     for expansion, names in pairs(WORLD_EXTRA) do
         for _, name in ipairs(names) do
             local key = normZoneKey(name)
-            if not map[key] then
+            local existing = map[key]
+            if not existing or existing.category ~= "world" then
                 map[key] = { category = "world", expansion = expansion }
             end
         end
     end
 
-    -- Open-world zones from the continent map (only where not already an instance).
+    -- Open-world zones from the continent map. A zone the continent map lists is
+    -- by definition open world, so it OVERRIDES any instance (dungeon/raid)
+    -- classification for the same normalized key. This is essential on a custom
+    -- server: Synastria registers open-world zones in the LFG database (e.g. warp
+    -- destinations), so the LFG pass above can mark a world zone like Teldrassil as
+    -- a "dungeon" -- the continent map is the authority that corrects it. Real
+    -- dungeons/raids are never continent-map zones, so legit instances are safe.
     if type(GetMapContinents) == "function" and type(GetMapZones) == "function" then
         local continents = { GetMapContinents() }
         for ci = 1, #continents do
@@ -2108,12 +2335,23 @@ local function buildZoneClassification()
             for _, zname in ipairs(zones) do
                 if type(zname) == "string" and zname ~= "" then
                     local key = normZoneKey(zname)
-                    if not map[key] then
+                    local existing = map[key]
+                    if not existing or existing.category ~= "world" then
                         map[key] = { category = "world", expansion = expansion }
                     end
                 end
             end
         end
+    end
+
+    -- Server-warp zones are ALWAYS open world: the warp list is outdoor zones and
+    -- cities, never instances. Seed them authoritatively from the bundled table
+    -- (always available -- no API/timing dependency), overriding any earlier
+    -- instance classification. This is the reliable fix for custom-server LFG
+    -- entries naming world zones, and for clients where GetMapZones doesn't list a
+    -- zone (e.g. Teldrassil) so the continent-map override above couldn't catch it.
+    for name, index in pairs(WARP_ZONE_INDEX) do
+        map[normZoneKey(name)] = { category = "world", expansion = warpZoneExpansion(index) }
     end
 
     -- Suffix-match list: the loot data prefixes many instances with their hub,
@@ -2332,6 +2570,7 @@ function AF.BuildZoneEV(data, evMode, minSpawns)
                     totalEvPer1000 = 0,
                     totalAffixesLeft = 0,
                     bestMobName = nil,
+                    bestMobNpcId = nil,  -- so a view can pin the best mob (Resist tab)
                     bestMobSpawns = 0,
                     bestMobItems = 0,
                 }
@@ -2345,6 +2584,7 @@ function AF.BuildZoneEV(data, evMode, minSpawns)
             if evPer1000 > zone.bestEvPer1000 then
                 zone.bestEvPer1000 = evPer1000
                 zone.bestMobName = mob.npcName
+                zone.bestMobNpcId = mob.npcId
                 zone.bestMobSpawns = mob.spawnedCount
                 zone.bestMobItems = mob.itemsDropped
             end
@@ -2385,9 +2625,7 @@ local function printScan(options)
         end
 
         local zoneName = getZoneName(getZoneId())
-        local forgeText = forgeFilter and (", " .. forgeFilter.label) or ""
-        local bindText = bindLabelText(options.bindFilter)
-        chat(zoneName .. " (" .. scope .. forgeText .. bindText .. ", mob sources)")
+        chat(zoneName .. " (" .. filterCaption(scope, forgeFilter, options.bindFilter) .. ", mob sources)")
 
         local row = findZoneRow(data, zoneName)
         if not row then
@@ -2422,9 +2660,7 @@ local function printZoneRankings(options)
 
         local rows = AF.BuildZoneRankings(data)
 
-        local forgeText = forgeFilter and (", " .. forgeFilter.label) or ""
-        local bindText = bindLabelText(options.bindFilter)
-        chat("Top zones by remaining affix value (" .. scope .. forgeText .. bindText
+        chat("Top zones by remaining affix value (" .. filterCaption(scope, forgeFilter, options.bindFilter)
             .. "; " .. #rows .. " zones, mob sources)")
         if #rows == 0 then
             chat("No remaining affix value found.")
@@ -2468,9 +2704,7 @@ local function printZoneExpectedValue(options)
             limit = AF.defaultZoneLimit
         end
         local modeLabel = EV_MODE_LABELS[evMode] or evMode
-        local forgeText = forgeFilter and (", " .. forgeFilter.label) or ""
-        local bindText = bindLabelText(options.bindFilter)
-        chat("Top zones by useful affix drops/1000 kills (" .. scope .. forgeText .. bindText
+        chat("Top zones by useful affix drops/1000 kills (" .. filterCaption(scope, forgeFilter, options.bindFilter)
             .. "; " .. modeLabel .. "; min spawns " .. minSpawns
             .. "; matched " .. #zones .. "/" .. zonesDiscovered .. " zones)")
 
@@ -3014,6 +3248,45 @@ local function countEntries(tbl)
     return n
 end
 
+-- Diagnostic for the warp-tier check the t3 assist depends on. For the current
+-- zone, resolves the warp index (bundled table, qtRunner supplement) and prints
+-- the CustomHasTeleport tier. Run /af warp.
+local function printWarpDebug()
+    local zoneName = AF.GetCurrentZoneName()
+    chat("Warp debug -- current zone: " .. tostring(zoneName) .. " (key: " .. normZoneKey(zoneName) .. ")")
+    local cat, exp = AF.ClassifyZone(zoneName)
+    local instNote = (cat == "dungeon" or cat == "raid")
+        and "  (warp assist won't open the map for instances)" or ""
+    chat("  classified as: " .. tostring(cat) .. " / " .. tostring(exp) .. instNote)
+
+    local warpIndex = bundledWarpIndex(zoneName)
+    local source = "bundled table"
+    if warpIndex == nil then
+        warpIndex = qtRunnerWarpIndex(zoneName)
+        source = "qtRunner"
+    end
+    if warpIndex == nil then
+        chat("  No warp index for this zone -- it has no zone warp (instances and a few zones never do).")
+        return
+    end
+    chat("  warp index = " .. tostring(warpIndex) .. " (from " .. source .. ")")
+
+    if type(_G.CustomHasTeleport) ~= "function" then
+        chat("  CustomHasTeleport is unavailable; cannot read the tier.")
+        return
+    end
+    local ok, value = safeCall(_G.CustomHasTeleport, warpIndex)
+    if not ok then
+        chat("  CustomHasTeleport call failed.")
+        return
+    end
+    local tier = tonumber(value)
+    chat(string.format("  CustomHasTeleport(%s) = %s  (0 none, 1 T1, 2 T2, 3 T3)",
+        tostring(warpIndex), tostring(value)))
+    chat(string.format("  T3 gate is >= %d -> warp assist opens the map: %s",
+        REQUIRED_WARP_TIER, tostring(tier ~= nil and tier >= REQUIRED_WARP_TIER)))
+end
+
 local function printMemReport()
     local addonKb
     if type(UpdateAddOnMemoryUsage) == "function" and type(GetAddOnMemoryUsage) == "function" then
@@ -3092,6 +3365,8 @@ local function parseOptions(msg)
             options.debug = true
         elseif token == "zonedbg" or token == "classify" or token == "zoneclass" then
             options.mode = "zonedbg"
+        elseif token == "warp" or token == "warpdbg" then
+            options.mode = "warpdbg"
         elseif token == "affixdbg" or token == "maskdbg" then
             options.mode = "affixdbg"
             options.affixDbg = true
@@ -3168,6 +3443,7 @@ local function printUsage()
     chat("Specific resist: /af resist <fire|nature|frost|shadow|arcane> [char|acc] [best|avg|total] [N] [limit]")
     chat("  e.g. /af resist fire, /af resist frost acc 5, /af resist arcane total 1 15")
     chat("Debug: /af debug <itemId|link> [maxRows], /af zonedbg (zone classification)")
+    chat("  /af warp (current-zone T3 warp-tier probe for the map-warp assist)")
     chat("  /af affixdbg <itemId|link> [maxBits] (affix mask <-> stat mapping probe)")
     chat("  /af affixid <item link> (rolled affix id + ItemAttuneAffix key scheme)")
     chat("  /af resistval <item link> (actual resist amount + scaling probe)")
@@ -3230,6 +3506,8 @@ SlashCmdList["AFFIXFINDER"] = function(msg)
         printResistRankings(options)
     elseif options.mode == "zonedbg" then
         printZoneClassification(options)
+    elseif options.mode == "warpdbg" then
+        printWarpDebug()
     elseif options.mode == "zones" and options.ev then
         printZoneExpectedValue(options)
     elseif options.mode == "zones" then
@@ -3240,12 +3518,9 @@ SlashCmdList["AFFIXFINDER"] = function(msg)
 end
 
 local frame = CreateFrame("Frame")
-frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("CHAT_MSG_SYSTEM")
 frame:SetScript("OnEvent", function(_, event, arg1)
-    if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
-        chat("loaded. Type /af ui for the window, or /af, /af zones, /af help.")
-    elseif event == "CHAT_MSG_SYSTEM" then
+    if event == "CHAT_MSG_SYSTEM" then
         -- Attuning changes how many affixes are left; drop cached aggregates.
         if type(arg1) == "string" and string.find(arg1, "You have attuned with", 1, true) then
             AF.ClearDynamicData()

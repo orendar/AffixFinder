@@ -120,8 +120,9 @@ local autoWarp = CreateFrame("CheckButton", "AffixFinderAutoWarpCheck", panel,
 autoWarp:SetPoint("TOPLEFT", mythic, "BOTTOMLEFT", 0, -10)
 SetRegionText(autoWarp:GetName(), "Text", "T3 map-warp assist from the Mobs view")
 autoWarp.tooltipText = "Mob rows always mark the latest clicked target on the map. "
-    .. "When enabled, AffixFinder also checks your t3 warp attunement and opens the zone map "
-    .. "so you can click the target location. Disabled by default."
+    .. "When enabled, AffixFinder also opens that zone's map so you can click the target to warp -- "
+    .. "but only when a warp is usable: it skips dungeons/raids and opens only for zones you actually "
+    .. "have the t3 warp for. Safe to leave on with a partial set of warps. Disabled by default."
 autoWarp:SetScript("OnClick", function(self)
     SaveConfig("automaticWarp", self:GetChecked() and true or false)
 end)
