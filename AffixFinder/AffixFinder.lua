@@ -1514,6 +1514,16 @@ function AF.GetItemAffixInfo(itemId, minSpawns)
     if not itemHasRandomAffix(itemId) then
         return nil
     end
+    -- Mirror the scan gates (affixedItemValue / affixedResistValue): melee
+    -- weapons attune a fixed weapon-stat amount, so their random affixes never
+    -- count -- the tooltip must drop them too, or it shows a phantom affix line
+    -- for an item the window correctly ignores.
+    if type(GetItemInfoCustom) == "function" then
+        local ok, _, _, _, _, _, itemType, itemSubType, _, itemEquipLoc = safeCall(GetItemInfoCustom, itemId)
+        if ok and isIgnoredMeleeWeapon(itemType, itemSubType, itemEquipLoc) then
+            return nil
+        end
+    end
     local possible, left = getMaskAffixCounts(itemId)
     if possible <= 0 then
         return nil
