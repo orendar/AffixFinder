@@ -76,6 +76,28 @@ local function normZoneKey(name)
     return table.concat(tokens, " ")
 end
 
+-- Display-name counterpart of normZoneKey: strips the same difficulty/size
+-- qualifiers from a raw zone name while preserving its case and punctuation
+-- ("Naxxramas 25" -> "Naxxramas", "Utgarde Keep Heroic" -> "Utgarde Keep").
+-- Used by the Instances view to label a folded variant row with the generic
+-- instance name instead of an arbitrary variant's.
+local function stripZoneQualifiers(name)
+    local tokens = {}
+    for w in string.gmatch(tostring(name or ""), "%S+") do
+        tokens[#tokens + 1] = w
+    end
+    local function isQual(tok)
+        return isQualifierToken(string.lower(string.gsub(tok, "[^%w]", "")))
+    end
+    while #tokens > 1 and isQual(tokens[#tokens]) do
+        tokens[#tokens] = nil
+    end
+    while #tokens > 1 and isQual(tokens[1]) do
+        table.remove(tokens, 1)
+    end
+    return table.concat(tokens, " ")
+end
+
 local INSTANCES = {
     classic = {
         dungeon = {
@@ -253,6 +275,23 @@ local function buildZoneClassification()
         map[normZoneKey(name)] = { category = "world", expansion = warpZoneExpansion(index) }
     end
 
+    -- Curated exceptions with the last word. Verified in-game via /af srcdbg:
+    -- the loot data names the Deadmines INSTANCE INTERIOR "Deadmines" (zone id
+    -- 32804 = 0x8000 + map 36) while "The Deadmines" is the OPEN-WORLD section
+    -- around the entrance in Westfall (AreaTable id 1581) -- which Synastria's
+    -- own world data correctly marks as world above, and that world entry
+    -- drops "the deadmines" from the suffix list below, so the bare interior
+    -- name needs its own entry to avoid falling through to unknown. (The
+    -- static INSTANCES list keeps "The Deadmines" for vanilla-ish clients
+    -- without the world pollution; in-game the world passes override it,
+    -- which is the correct outcome for the outdoor section.)
+    local INSTANCE_OVERRIDES = {
+        { name = "Deadmines", category = "dungeon", expansion = "classic" },
+    }
+    for _, o in ipairs(INSTANCE_OVERRIDES) do
+        map[normZoneKey(o.name)] = { category = o.category, expansion = o.expansion }
+    end
+
     -- Suffix-match list: the loot data prefixes many instances with their hub,
     -- e.g. "Auchindoun: Auchenai Crypts", "Coilfang: Serpentshrine Cavern". The
     -- instance name is the tail of the key, so collect every instance key
@@ -318,4 +357,5 @@ end
 
 I.ZoneClassify = {
     normZoneKey = normZoneKey,
+    stripZoneQualifiers = stripZoneQualifiers,
 }

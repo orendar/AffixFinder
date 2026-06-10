@@ -401,6 +401,52 @@ local function printDebugItem(options)
     end
 end
 
+-- Raw, position-by-position dump of EVERY return value of ItemLocGetSourceAt
+-- (type-tagged, true return count via select('#')), beyond the 8 fields the
+-- scan reads. Purpose: discover whether the API exposes extra fields (a zone
+-- or map id) that could distinguish an instance's INTERIOR from the open-world
+-- section sharing its name (e.g. the Deadmines entrance area) -- the zone NAME
+-- alone cannot. /af srcdbg <itemId|link> [maxRows].
+local function printSourceRawDump(options)
+    local itemId = options.debugItemId
+    if not itemId then
+        chat("Usage: /af srcdbg <itemId|item link> [maxRows]")
+        return
+    end
+    if type(ItemLocGetSourceCount) ~= "function" or type(ItemLocGetSourceAt) ~= "function" then
+        chat("ItemLoc APIs are unavailable on this client.")
+        return
+    end
+
+    local function formatRow(ok, ...)
+        if not ok then
+            return nil
+        end
+        local n = select("#", ...)
+        local parts = {}
+        for v = 1, n do
+            local val = select(v, ...)
+            parts[#parts + 1] = "[" .. v .. "]=" .. type(val) .. ":" .. tostring(val)
+        end
+        return n .. " returns: " .. table.concat(parts, "  ")
+    end
+
+    local count = safeFirst(ItemLocGetSourceCount, itemId) or 0
+    local maxRows = tonumber(options.limit)
+    if not maxRows or maxRows < 1 then
+        maxRows = 10
+    end
+    chat("Raw ItemLocGetSourceAt dump for item " .. itemId .. " (" .. count .. " rows, showing up to " .. maxRows .. "):")
+    local shown = math.min(count, maxRows)
+    for i = 1, shown do
+        local line = formatRow(safeCall(ItemLocGetSourceAt, itemId, i))
+        chat("  row " .. i .. ": " .. (line or "<error reading source row>"))
+    end
+    if count > shown then
+        chat("  ... " .. (count - shown) .. " more row(s); /af srcdbg " .. itemId .. " " .. count)
+    end
+end
+
 -- Calls fn(globalBitIndex) for each set bit of a 32-bit mask. baseOffset places
 -- the word in the 64-bit affix space (word1 -> 0, word2 -> 32) so the indices
 -- line up with how GetItemAffixMask splits possible/attuned across two returns.
@@ -840,6 +886,7 @@ I.Debug = {
     printAffixDebug = printAffixDebug,
     printAffixIdProbe = printAffixIdProbe,
     printDebugItem = printDebugItem,
+    printSourceRawDump = printSourceRawDump,
     printMemReport = printMemReport,
     printResistValue = printResistValue,
     printWarpDebug = printWarpDebug,

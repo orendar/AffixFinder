@@ -727,7 +727,12 @@ local function getCreatureSources(itemId)
     local byKey = {}
     local sourceCount = safeFirst(ItemLocGetSourceCount, itemId) or 0
     for sourceIndex = 1, sourceCount do
-        local ok, srcType, srcObjType, srcObjId, chance, dropsPerThousand, objName, zoneName, spawnedCount =
+        -- 9th return: the source's zone ID. Instance interiors carry bit
+        -- 0x8000 (id - 32768 = the instance map id, e.g. Deadmines = 32804 =
+        -- 0x8000 + map 36); the open-world section sharing an instance's name
+        -- has a plain AreaTable id (The Deadmines entrance = 1581). See
+        -- synastria_api.md; confirmed in-game via /af srcdbg.
+        local ok, srcType, srcObjType, srcObjId, chance, dropsPerThousand, objName, zoneName, spawnedCount, srcZoneId =
             safeCall(ItemLocGetSourceAt, itemId, sourceIndex)
         zoneName = ok and trim(zoneName) or ""
         local npcId = tonumber(srcObjId) or 0
@@ -747,6 +752,7 @@ local function getCreatureSources(itemId)
                         npcName = (objName and objName ~= "" and tostring(objName)) or ("NPC #" .. npcId),
                         dropProbability = dropProbability,
                         spawnedCount = spawns,
+                        zoneId = tonumber(srcZoneId),
                     }
                     byKey[key] = entry
                     sources[#sources + 1] = entry
@@ -756,6 +762,9 @@ local function getCreatureSources(itemId)
                     end
                     if spawns > entry.spawnedCount then
                         entry.spawnedCount = spawns
+                    end
+                    if not entry.zoneId then
+                        entry.zoneId = tonumber(srcZoneId)
                     end
                     if string.find(entry.npcName, "^NPC #") and objName and objName ~= "" then
                         entry.npcName = tostring(objName)
@@ -1212,6 +1221,16 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
         local rowsByZone = {}
         local rows = {}
         local mobsByKey = {}
+        -- Kill-denominator tally for the Instances view: zoneName -> npcId ->
+        -- max reported spawns, over EVERY affixed item's killable sources --
+        -- including items the value gate drops (melee weapons, fully-attuned,
+        -- bind/mythic-filtered): their droppers still die in a full clear, so
+        -- "kills per clear" wants them. Ints only; in-memory like the rest.
+        local killsByZoneNpc = {}
+        -- zoneName -> source zone ID (first seen). Bit 0x8000 marks an
+        -- instance INTERIOR; the Instances view uses it to drop the open-world
+        -- section that shares an instance's name (Deadmines entrance problem).
+        local zoneIdsByName = {}
         -- Central per-item record (in-memory aggregate, like mobsByKey -- never
         -- persisted). One entry per affixed item that still has affixes left and
         -- a killable source; the Items panel and per-item views read it without a
@@ -1226,12 +1245,29 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
 
         runChunked(#ids, function(i)
             local itemId = ids[i]
-            local value = affixedItemValue(itemId, scope, forgeFilter, bindFilter, includeMythics, perClass)
-            if not value then
-                return
-            end
+            -- Sources come before the value gate so the kill tally sees every
+            -- affixed item's droppers, not just the gated ones.
             local sources = getCreatureSources(itemId)
-            if #sources == 0 then
+            for s = 1, #sources do
+                local src = sources[s]
+                if src.zoneId and not zoneIdsByName[src.zoneName] then
+                    zoneIdsByName[src.zoneName] = src.zoneId
+                end
+                -- 0-spawn rows (summons/scripted spawns) are not real clear
+                -- kills; keep them out of the denominator.
+                if (src.spawnedCount or 0) > 0 then
+                    local zoneKills = killsByZoneNpc[src.zoneName]
+                    if not zoneKills then
+                        zoneKills = {}
+                        killsByZoneNpc[src.zoneName] = zoneKills
+                    end
+                    if (zoneKills[src.npcId] or 0) < src.spawnedCount then
+                        zoneKills[src.npcId] = src.spawnedCount
+                    end
+                end
+            end
+            local value = affixedItemValue(itemId, scope, forgeFilter, bindFilter, includeMythics, perClass)
+            if not value or #sources == 0 then
                 return
             end
             affixedItemsScanned = affixedItemsScanned + 1
@@ -1359,6 +1395,8 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
                 rowsByZone = rowsByZone,
                 mobsByKey = mobsByKey,
                 itemsById = itemsById,
+                killsByZoneNpc = killsByZoneNpc,
+                zoneIdsByName = zoneIdsByName,
                 affixedItemsScanned = affixedItemsScanned,
             })
         end, progress)
@@ -1741,6 +1779,242 @@ function AF.BuildZoneEV(data, evMode, minSpawns)
     end)
 
     return zones, zonesDiscovered, mobsBelowThreshold
+end
+
+-- Ranks dungeons/raids by what a FULL CLEAR is worth, for players who would
+-- rather plow through a whole instance than camp one mob (there are no warps
+-- into instance interiors, so partially-targeted farming there means clearing
+-- to the target anyway). Pure display-time over the slice, like the other
+-- builders -- never scans.
+--
+-- Difficulty/size variants ("Naxxramas", "Naxxramas 25", "Utgarde Keep Heroic")
+-- FOLD into one row, keyed by ZoneClassify's normZoneKey: the server splits
+-- source data incompletely across variant names (the non-default variant lists
+-- only its exclusive drops, usually at 1 spawn), so per-variant rows cannot be
+-- made accurate -- one row per instance is the honest unit. The same npc
+-- appearing under several variants is deduped at max spawns (kills) with its
+-- EV shares summed (each variant row carries that variant's loot). EXCEPTION:
+-- Mythic variants are a separate dungeon on Synastria (their drop pool is not
+-- shared with normal/heroic), so they keep their own row and never fold into
+-- the base instance. 0-spawn mobs (summons/scripted spawns) are skipped
+-- entirely -- they are not real clear kills.
+--
+-- Each instance row:
+--   zoneName       : the GENERIC instance name (qualifiers stripped --
+--                    "Naxxramas", never "Naxxramas 25"); Mythic rows read
+--                    "<name> (Mythic)"
+--   category       : "dungeon" | "raid" (from AF.ClassifyZone)
+--   evPerClear     : sum over its mobs of spawnedCount * evPerKill -- expected
+--                    useful affix attunes from one full clear. Instance trash
+--                    does not respawn, so spawn count is a genuinely good
+--                    kills-per-clear estimate (unlike open world).
+--   killsPerClear  : total spawns of every mob that drops ANY affixed item
+--                    (from data.killsByZoneNpc, which the scan tallies before
+--                    the value gate -- melee-weapon/attuned/filtered droppers
+--                    still die in a clear). Mobs dropping no affixed item at
+--                    all remain uncounted; that is as close as the source data
+--                    gets. Falls back to contributing spawns on slices without
+--                    the tally (e.g. resist).
+--   evPer1000      : evPerClear / killsPerClear * 1000, comparable to the
+--                    Mobs/EV views' density numbers.
+--   affixesLeft    : per-mob remaining affixes summed (same double-counting
+--                    caveat as BuildZoneEV's totalAffixesLeft: an item dropped
+--                    by several mobs counts once per mob).
+--   contributors   : top mobs by share of evPerClear, best-first, capped --
+--                    { npcName, npcId, spawnedCount, evShare } for the "why is
+--                    this ranked #1" tooltip.
+--
+-- classToken (account scope) takes each mob's EV/affix tallies from byClass,
+-- but killsPerClear is class-independent: a clear kills the whole instance
+-- regardless of who the loot is for. Instances with no EV left for the class
+-- are dropped.
+--
+-- No minSpawns: the premise is "you kill everything anyway", so hiding sparse
+-- mobs would only understate an instance.
+local MAX_INSTANCE_CONTRIBUTORS = 5
+
+function AF.BuildInstanceRankings(data, classToken)
+    -- ZoneClassify loads after this file; resolve its helpers at call time
+    -- (builders only run at display time). Without them, no folding.
+    local ZC = I.ZoneClassify
+    local normKey = (ZC and ZC.normZoneKey) or function(z) return z end
+    local stripQual = (ZC and ZC.stripZoneQualifiers) or function(z) return z end
+
+    -- normZoneKey treats "mythic" as a difficulty qualifier, but on Synastria a
+    -- Mythic dungeon has its OWN drop pool -- so its fold key gets a marker
+    -- ("##" cannot occur in a normalized key) and its display name keeps the
+    -- Mythic tag on the generic instance name.
+    local function isMythicName(zoneName)
+        return string.find(string.lower(tostring(zoneName or "")), "mythic", 1, true) ~= nil
+    end
+    local function foldKey(zoneName)
+        local key = normKey(zoneName)
+        if isMythicName(zoneName) then
+            return key .. " ##mythic"
+        end
+        return key
+    end
+    local function displayName(zoneName)
+        local name = stripQual(zoneName)
+        if isMythicName(zoneName) then
+            return name .. " (Mythic)"
+        end
+        return name
+    end
+
+    -- Interior gate from the source rows' zone id (9th ItemLocGetSourceAt
+    -- return): bit 0x8000 marks an instance INTERIOR (id - 32768 = instance
+    -- map id; Deadmines = 32804 = 0x8000 + 36), while the open-world section
+    -- sharing the instance's name has a plain AreaTable id (The Deadmines
+    -- entrance = 1581). This view is explicitly about what you kill INSIDE,
+    -- so: bit set -> include (even if the name classifies oddly); bit clear ->
+    -- exclude (outdoor, even if the name classifies as dungeon); id unknown
+    -- (older slice shapes / resist) -> fall back to name classification.
+    -- Returns include, category.
+    local INSTANCE_MAP_BIT = 32768
+    local zoneIds = data.zoneIdsByName
+    local function instanceGate(zoneName)
+        local interior
+        local id = zoneIds and zoneIds[zoneName]
+        if id then
+            interior = bitAnd(id, INSTANCE_MAP_BIT) ~= 0
+            if not interior then
+                return false
+            end
+        end
+        local category = AF.ClassifyZone(zoneName)
+        if category ~= "dungeon" and category ~= "raid" then
+            if interior then
+                category = "dungeon"  -- interior by id but unlisted by name
+            else
+                return false
+            end
+        end
+        return true, category
+    end
+
+    local byKey = {}
+    local rows = {}
+    local function instFor(zoneName, category)
+        local key = foldKey(zoneName)
+        local inst = byKey[key]
+        if not inst then
+            inst = {
+                zoneName = displayName(zoneName),
+                category = category,
+                evPerClear = 0,
+                killsPerClear = 0,
+                evPer1000 = 0,
+                affixesLeft = 0,
+                contributors = {},
+                -- build-time scratch, dropped before returning:
+                _contribByNpc = {},   -- npcId -> merged contributor record
+                _killsByNpc = {},     -- npcId -> max spawns across variants
+            }
+            byKey[key] = inst
+            rows[#rows + 1] = inst
+        end
+        return inst
+    end
+
+    -- EV side: the contributing mobs (the slice has per-mob EV only for these).
+    for _, mob in pairs(data.mobsByKey) do
+        local spawns = mob.spawnedCount or 0
+        local include, category = false, nil
+        if spawns > 0 then
+            include, category = instanceGate(mob.zoneName)
+        end
+        if include then
+            local inst = instFor(mob.zoneName, category)
+            if not data.killsByZoneNpc then
+                -- Kill fallback for slices without the full tally.
+                if (inst._killsByNpc[mob.npcId] or 0) < spawns then
+                    inst._killsByNpc[mob.npcId] = spawns
+                end
+            end
+            local tally = mob
+            if classToken then
+                tally = mob.byClass and mob.byClass[classToken]
+            end
+            if tally and tally.evPerKill > 0 then
+                local evShare = spawns * tally.evPerKill
+                if evShare > 0 then
+                    inst.evPerClear = inst.evPerClear + evShare
+                    inst.affixesLeft = inst.affixesLeft + tally.affixesLeft
+                    local c = inst._contribByNpc[mob.npcId]
+                    if not c then
+                        c = { npcName = mob.npcName, npcId = mob.npcId,
+                              spawnedCount = spawns, evShare = 0 }
+                        inst._contribByNpc[mob.npcId] = c
+                    end
+                    c.evShare = c.evShare + evShare
+                    if spawns > c.spawnedCount then
+                        c.spawnedCount = spawns
+                    end
+                end
+            end
+        end
+    end
+
+    -- Kill-denominator side: every affix-dropping mob the scan saw, folded the
+    -- same way. Only instances that still have EV matter (byKey hit).
+    if data.killsByZoneNpc then
+        for zoneName, byNpc in pairs(data.killsByZoneNpc) do
+            if instanceGate(zoneName) then
+                local inst = byKey[foldKey(zoneName)]
+                if inst then
+                    for npcId, spawns in pairs(byNpc) do
+                        if (inst._killsByNpc[npcId] or 0) < spawns then
+                            inst._killsByNpc[npcId] = spawns
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Drop instances with nothing left for this slice, normalize, and trim the
+    -- contributor lists to the tooltip's handful.
+    local kept = {}
+    for _, inst in ipairs(rows) do
+        if inst.evPerClear > 0 then
+            local kills = 0
+            for _, spawns in pairs(inst._killsByNpc) do
+                kills = kills + spawns
+            end
+            inst.killsPerClear = kills
+            if kills > 0 then
+                inst.evPer1000 = inst.evPerClear / kills * 1000
+            end
+            local contributors = {}
+            for _, c in pairs(inst._contribByNpc) do
+                contributors[#contributors + 1] = c
+            end
+            table.sort(contributors, function(a, b)
+                if a.evShare ~= b.evShare then
+                    return a.evShare > b.evShare
+                end
+                return tostring(a.npcName or "") < tostring(b.npcName or "")
+            end)
+            for i = #contributors, MAX_INSTANCE_CONTRIBUTORS + 1, -1 do
+                contributors[i] = nil
+            end
+            inst.contributors = contributors
+            inst._contribByNpc, inst._killsByNpc = nil, nil
+            kept[#kept + 1] = inst
+        end
+    end
+
+    table.sort(kept, function(a, b)
+        if a.evPer1000 ~= b.evPer1000 then
+            return a.evPer1000 > b.evPer1000
+        end
+        if a.evPerClear ~= b.evPerClear then
+            return a.evPerClear > b.evPerClear
+        end
+        return tostring(a.zoneName or "") < tostring(b.zoneName or "")
+    end)
+    return kept
 end
 
 

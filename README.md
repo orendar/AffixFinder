@@ -36,6 +36,7 @@ Enable **AffixFinder** at the character-select screen.
 - `/af zones` ranks zones for your current character.
 - `/af zones acc` ranks zones for your account.
 - `/af zones ev 5` ranks zones by their best farmable mobs.
+- `/af instances` ranks full dungeon/raid clears.
 - `/af resist fire` ranks fire-resistance farms.
 - `/af config` opens settings.
 - `/af help` lists commands.
@@ -49,6 +50,7 @@ The window includes:
 - **Zones** - zone rankings by remaining affix value
 - **Mobs** - individual mob rankings, with zone and spawn filters
 - **Items** - the actual affixed items still worth farming, with the specific suffixes you still need and the best mob to farm each from
+- **Instances** - full dungeon/raid clears ranked by expected affixes per clear and per 1000 kills, for when you would rather just run a dungeon than camp one mob
 - **Current Zone** - what is still useful where you are standing
 - **Classes** - account-scope class breakdowns
 - **Resist** - targeted farming for one resistance school
@@ -80,6 +82,7 @@ AffixFinder does not save the full item graph or ranking results. It only persis
 - Forged attunement is cumulative downward: TF also attunes the base affix, WF also attunes TF and base, and LF also attunes WF, TF, and base. AffixFinder unions the included tiers, so a suffix available at several forge levels is counted once rather than multiplied.
 - Bind filters can include BoP, BoE, or both.
 - Melee weapons are ignored because their random affixes do not contribute attuned stats on Synastria. Ranged weapons, wands, and shields are still counted.
+- The Instances tab models a **full clear**: each mob's expected drops times its spawn count, summed over the instance. "Kills per clear" counts every mob that drops any affixed item, so the per-1000-kills density divides by something close to a real clear. Difficulty and raid-size variants (Heroic, 10/25) fold into one row under the generic instance name; Mythic dungeons keep their own row (their drop pool is separate). Only mobs inside the instance count — open-world areas around an entrance that share the instance's name are excluded. Sort raids by **Affixes/clear** rather than density; lockouts make density the wrong measure for them.
 - Resistance values are estimates based on item level, because the exact rolled suffix value is not available during scans.
 - Diagnostic commands such as `/af debug`, `/af zonedbg`, and `/af warp` are available if you want to inspect what the addon is reading.
 

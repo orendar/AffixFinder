@@ -131,6 +131,43 @@ local function printZoneExpectedValue(options)
     end)
 end
 
+-- Ranks full dungeon/raid clears (the UI's Instances tab, in chat form):
+-- expected affixes per clear and per 1000 kills of affix-dropping mobs.
+-- Sorted by density like the tab's default sort; shares the scope/forge/bind
+-- and limit semantics of /af zones.
+local function printInstanceRankings(options)
+    local scope = options.scope or AF.defaultScope or "character"
+    local forgeFilter = options.forgeFilter
+    AF.ComputeZoneData(scope, forgeFilter, options.bindFilter, function(data, err)
+        if not data then
+            reportScanError(err, "scan instances")
+            return
+        end
+
+        local rows = AF.BuildInstanceRankings(data)
+        local limit = tonumber(options.limit) or AF.defaultZoneLimit
+        if limit < 1 then
+            limit = AF.defaultZoneLimit
+        end
+
+        chat("Top instances by full-clear value (" .. filterCaption(scope, forgeFilter, options.bindFilter)
+            .. "; " .. #rows .. " instances; sorted by affixes/1000 kills; kills count affix-dropping mobs)")
+        if #rows == 0 then
+            chat("No dungeons or raids with remaining affix value found.")
+            return
+        end
+
+        local shown = math.min(limit, #rows)
+        for i = 1, shown do
+            local r = rows[i]
+            chat(i .. ". " .. r.zoneName .. " (" .. (r.category == "raid" and "raid" or "dungeon") .. "): "
+                .. string.format("%.2f", r.evPer1000 or 0) .. "/1000 kills, "
+                .. string.format("%.2f", r.evPerClear or 0) .. " per clear, ~"
+                .. tostring(r.killsPerClear or 0) .. " kills/clear")
+        end
+    end)
+end
+
 -- Ranks zones by how often a chosen resist would roll on a killable drop
 -- (attunes per 1000 kills), reusing the generic EV builder over the resist data
 -- slice. Shares the spawn-threshold / mode / limit semantics of /af zones ev.
@@ -196,6 +233,7 @@ end
 
 
 I.Output = {
+    printInstanceRankings = printInstanceRankings,
     printResistRankings = printResistRankings,
     printScan = printScan,
     printZoneExpectedValue = printZoneExpectedValue,

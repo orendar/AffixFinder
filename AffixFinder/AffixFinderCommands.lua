@@ -10,6 +10,7 @@ local FORGE_FLAGS = I.FORGE_FLAGS
 local Output = I.Output
 local Debug = I.Debug
 local printScan = Output.printScan
+local printInstanceRankings = Output.printInstanceRankings
 local printZoneRankings = Output.printZoneRankings
 local printZoneExpectedValue = Output.printZoneExpectedValue
 local printResistRankings = Output.printResistRankings
@@ -17,6 +18,7 @@ local printZoneClassification = Debug.printZoneClassification
 local printZoneItemDump = Debug.printZoneItemDump
 local printDebugItem = Debug.printDebugItem
 local printAffixDebug = Debug.printAffixDebug
+local printSourceRawDump = Debug.printSourceRawDump
 local printAffixIdProbe = Debug.printAffixIdProbe
 local printResistValue = Debug.printResistValue
 local printWarpDebug = Debug.printWarpDebug
@@ -61,6 +63,8 @@ local function parseOptions(msg)
             options.config = true
         elseif token == "zones" or token == "zone" or token == "rank" or token == "rankings" then
             options.mode = "zones"
+        elseif token == "instances" or token == "instance" or token == "inst" or token == "dungeons" or token == "raids" then
+            options.mode = "instances"
         elseif token == "ev" or token == "value" or token == "expected" then
             options.mode = "zones"
             options.ev = true
@@ -79,6 +83,9 @@ local function parseOptions(msg)
         elseif token == "affixid" or token == "affixprobe" then
             options.mode = "affixid"
             options.affixDbg = true
+        elseif token == "srcdbg" or token == "sourcedbg" or token == "srcraw" then
+            options.mode = "srcdbg"
+            options.affixDbg = true  -- numbers parse as itemId then maxRows
         elseif token == "resistval" or token == "resval" then
             options.mode = "resistval"
             options.affixDbg = true
@@ -144,6 +151,7 @@ local function printUsage()
     chat("Usage: /af [zones [ev ...]] [character|char|c|account|acc|a] [none|tf|wf|lf] [bop|boe|both] [breakdown] [limit]")
     chat("Current zone: /af, /af acc, /af acc tf breakdown")
     chat("Zone rankings: /af zones, /af zones acc, /af zones acc wf 15")
+    chat("Instances: /af instances [char|acc] [none|tf|wf|lf] [bop|boe|both] [limit] (full-clear value)")
     chat("Expected value: /af zones ev [best|avg|total] N [limit] (N = min mob spawn count)")
     chat("  e.g. /af zones ev 5, /af zones acc ev total 10, /af zones ev avg 1 20")
     chat("Specific resist: /af resist <fire|nature|frost|shadow|arcane> [char|acc] [best|avg|total] [N] [limit]")
@@ -153,6 +161,7 @@ local function printUsage()
     chat("  /af warp (current-zone T3 warp-tier probe for the map-warp assist)")
     chat("  /af affixdbg <itemId|link> [none|tf|wf|lf] [maxBits] (forge-level affix mask probe)")
     chat("  /af affixid <item link> (rolled affix id + ItemAttuneAffix key scheme)")
+    chat("  /af srcdbg <itemId|link> [maxRows] (raw source-row returns, incl. undocumented fields)")
     chat("  /af resistval <item link> (actual resist amount + scaling probe)")
     chat("Maintenance: /af clearcache (reset + rediscover), /af mem (memory report)")
     chat("Forge filters are thresholds: tf=TF/WF/LF, wf=WF/LF, lf=LF; suffixes are counted once.")
@@ -208,6 +217,8 @@ SlashCmdList["AFFIXFINDER"] = function(msg)
         printAffixDebug(options)
     elseif options.mode == "affixid" then
         printAffixIdProbe(options)
+    elseif options.mode == "srcdbg" then
+        printSourceRawDump(options)
     elseif options.mode == "resistval" then
         printResistValue(options)
     elseif options.mode == "resist" then
@@ -218,6 +229,8 @@ SlashCmdList["AFFIXFINDER"] = function(msg)
         printZoneItemDump(options)
     elseif options.mode == "warpdbg" then
         printWarpDebug()
+    elseif options.mode == "instances" then
+        printInstanceRankings(options)
     elseif options.mode == "zones" and options.ev then
         printZoneExpectedValue(options)
     elseif options.mode == "zones" then

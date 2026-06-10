@@ -63,6 +63,8 @@ end
 -- Layout constants
 -- ---------------------------------------------------------------------------
 local FRAME_W = 600
+-- Height before the tab block is laid out; UI.Build derives the real height
+-- from how many rows the tab bar wraps into.
 local FRAME_H = 588
 local PAD = 14
 local INNER_W = FRAME_W - PAD * 2
@@ -157,7 +159,20 @@ local function CreateMultiSegmented(parent, options, selectedSet, onChange)
 
     function seg:Apply()
         for _, b in ipairs(self.buttons) do
-            if self.selected[b.value] then
+            if b.afDisabled then
+                -- A disabled button must stay visually neutral no matter what
+                -- the selection set says (Toggle() re-Applies on every click,
+                -- which used to re-light a disabled-but-selected World). Our
+                -- own flag, NOT Button:IsEnabled(): 3.3.5 returns 0 for
+                -- disabled, and 0 is truthy in Lua. Order matters too: a
+                -- SetButtonState() call AFTER Disable() repaints the normal
+                -- (enabled-looking) face over the greyed one, so reset the
+                -- state while enabled and Disable() LAST.
+                b:Enable()
+                b:SetButtonState("NORMAL")
+                b:UnlockHighlight()
+                b:Disable()
+            elseif self.selected[b.value] then
                 b:SetButtonState("PUSHED", true)
                 b:LockHighlight()
             else
@@ -194,6 +209,19 @@ local function CreateMultiSegmented(parent, options, selectedSet, onChange)
             if enabled then b:Enable() else b:Disable() end
         end
         if enabled then self:Apply() end
+    end
+
+    -- Enable/disable one button (the Instances tab locks out only World). The
+    -- underlying selection set is untouched; Apply() owns the disable call and
+    -- its visual sequencing, and restores the selected look on re-enable.
+    function seg:SetButtonEnabled(value, enabled)
+        for _, b in ipairs(self.buttons) do
+            if b.value == value then
+                b.afDisabled = (not enabled) or nil
+                if enabled then b:Enable() end
+            end
+        end
+        self:Apply()
     end
 
     seg:Apply()
@@ -277,6 +305,18 @@ local function ZonePasses(zoneName)
     return catOk and expOk
 end
 
+-- Expansion-only variant for panels that force their own category slice (the
+-- Instances tab is dungeons+raids by definition, so the shared Source filter is
+-- locked out there and only Expansion can narrow it).
+local function ExpansionPasses(zoneName)
+    local expSet = UI.filters.expansion
+    if allSelected(expSet, EXPANSION_ORDER) then
+        return true
+    end
+    local _, exp = AF.ClassifyZone(zoneName)
+    return exp == "unknown" or expSet[exp]
+end
+
 -- Short "; a+b" style note for a multi-select set when it isn't fully selected.
 local function setNote(set, order, labels)
     if allSelected(set, order) then
@@ -289,7 +329,9 @@ local function setNote(set, order, labels)
     return "; " .. table.concat(parts, "+")
 end
 
-local function FilterCaption()
+-- skipCategoryNote: panels that lock the Source filter (Instances) pass true so
+-- the caption never echoes a category selection that does not apply to them.
+local function FilterCaption(skipCategoryNote)
     local scope = UI.filters.scope
     local ff = CurrentForgeFilter()
     local bindLabel = AF.BindLabel and AF.BindLabel(CurrentBindFilter())
@@ -301,7 +343,7 @@ local function FilterCaption()
         .. ", " .. tostring((ff and ff.label) or "None")
         .. (bindLabel and (", " .. bindLabel) or "")
         .. classNote
-        .. setNote(UI.filters.category, CATEGORY_ORDER, CATEGORY_LABELS)
+        .. (skipCategoryNote and "" or setNote(UI.filters.category, CATEGORY_ORDER, CATEGORY_LABELS))
         .. setNote(UI.filters.expansion, EXPANSION_ORDER, EXPANSION_LABELS)
 end
 
@@ -694,6 +736,89 @@ PANELS[#PANELS + 1] = {
         BuildSearchSpawnControls(panel, strip, "Search:", "item", "item name")
     end,
     syncControls = SyncSearchSpawnControls,
+}
+
+-- --- Panel: Instances (full dungeon/raid clears, ranked) -------------------
+-- For "just let me run a dungeon" farming: there are no warps into instance
+-- interiors, so target-farming a deep mob means clearing to it anyway -- the
+-- honest unit is the FULL CLEAR. Rows come from AF.BuildInstanceRankings (pure
+-- display-time over the shared slice; switching to this tab never rescans).
+-- World never applies here, so the Source control's World button is locked out
+-- (instanceCategoriesOnly) while Dungeon/Raid act as filters; Expansion is
+-- checked internally via ExpansionPasses since there is no zoneField. No
+-- Min-spawns either: a clear kills everything, sparse mobs included.
+PANELS[#PANELS + 1] = {
+    id = "instances",
+    title = "Instances",
+    defaultSort = 4,  -- density (per 1k kills): the right default for
+                      -- resettable dungeons; raid shoppers sort by Affixes/clear
+    instanceCategoriesOnly = true,
+    columns = {
+        { title = "Instance", width = 210, justify = "LEFT",
+          value = function(e) return e.zoneName or "" end },
+        { title = "Type", width = 70, justify = "LEFT",
+          headerTooltip = "Dungeon or raid. Raids are lockout-bound, so judge them by Affixes/clear rather than density.",
+          value = function(e) return e.category == "raid" and "Raid" or "Dungeon" end },
+        { title = "Affixes/clear", width = 96, justify = "RIGHT", numeric = true,
+          headerTooltip = "Expected useful affix attunes from one full clear: each mob's drops-per-kill times its spawn count, summed over the instance. The number that matters for lockout-bound raids.",
+          value = function(e) return num(e.evPerClear) end,
+          text = function(e) return string.format("%.2f", num(e.evPerClear)) end },
+        { title = "Per 1k kills", width = 90, justify = "RIGHT", numeric = true,
+          headerTooltip = "Affixes per clear normalized per 1000 kills, counting every mob that drops any affixed item (needed or not), comparable to the Mobs tab's Drops/1k. Default sort: the efficiency number for resettable dungeons.",
+          value = function(e) return num(e.evPer1000) end,
+          text = function(e) return string.format("%.2f", num(e.evPer1000)) end },
+        { title = "Kills/clear", width = 80, justify = "RIGHT", numeric = true,
+          headerTooltip = "Total spawns of every mob here that drops any affixed item -- a rough length/effort indicator. Instance trash does not respawn, so spawns closely track kills per clear.",
+          value = function(e) return num(e.killsPerClear) end },
+    },
+    getRows = function(data)
+        local rows = AF.BuildInstanceRankings(data, UI.filters.class)
+        -- Dungeon/Raid act as filters here; World never applies. If neither is
+        -- selected (only World on), treat as both so the tab never goes blank.
+        local cs = UI.filters.category
+        local catSet = (cs.dungeon or cs.raid) and cs or nil
+        local filtered = {}
+        for _, e in ipairs(rows) do
+            if (not catSet or catSet[e.category]) and ExpansionPasses(e.zoneName) then
+                filtered[#filtered + 1] = e
+            end
+        end
+        return filtered
+    end,
+    summary = function(data, n)
+        local cs = UI.filters.category
+        local catNote = ""
+        if cs.dungeon and not cs.raid then
+            catNote = "; Dungeon"
+        elseif cs.raid and not cs.dungeon then
+            catNote = "; Raid"
+        end
+        return string.format(
+            "%d instances by full-clear value (%s%s) -- hover a row for its top contributors",
+            n, FilterCaption(true), catNote)
+    end,
+    tooltip = function(e)
+        local lines = {
+            { left = e.zoneName, right = e.category == "raid" and "Raid" or "Dungeon" },
+            { left = "  Affixes per full clear", right = string.format("%.2f", num(e.evPerClear)) },
+            { left = "  Kills per clear (affix-dropping mobs)", right = tostring(num(e.killsPerClear)) },
+            { left = "  Per 1000 of those kills", right = string.format("%.2f", num(e.evPer1000)) },
+            { left = "  Affixes left across its mobs", right = tostring(num(e.affixesLeft)) },
+        }
+        if e.contributors and #e.contributors > 0 then
+            lines[#lines + 1] = { left = "  Top contributors:" }
+            for _, c in ipairs(e.contributors) do
+                -- Spawn counts can be fractional (rare/shared spawn points
+                -- report e.g. 0.3); %d would truncate those to a lying "0".
+                lines[#lines + 1] = {
+                    left = "    " .. tostring(c.npcName or "?"),
+                    right = string.format("%.2f (%s spawns)", c.evShare or 0, tostring(c.spawnedCount or 0)),
+                }
+            end
+        end
+        lines[#lines + 1] = { left = "  Difficulty/size variants fold into one row." }
+        return lines
+    end,
 }
 
 -- --- Panel: Current Zone (per-category breakdown for the player's zone) -----
@@ -1246,38 +1371,52 @@ function UI.Build()
     UI.expSeg = expSeg
     UI.forgeLabel = forgeLabel
     UI.bindLabel = bindLabel
+    UI.sourceLabel = sourceLabel
 
-    -- Tab buttons (one per panel)
+    -- Tab buttons (one per panel). The bar wraps to a new row when a tab would
+    -- overflow the frame; everything below is positioned off the last row (and
+    -- the frame height follows), so adding a panel never needs offset surgery.
     UI.tabButtons = {}
-    local tx = PAD
+    local tx, ty = PAD, -124
     for i, panel in ipairs(PANELS) do
         local b = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
         b:SetHeight(22)
         b:SetWidth(math.max(70, panel.title:len() * 8 + 16))
         b:SetText(panel.title)
-        b:SetPoint("TOPLEFT", tx, -124)
+        if tx + b:GetWidth() > PAD + INNER_W then
+            tx = PAD
+            ty = ty - 26
+        end
+        b:SetPoint("TOPLEFT", tx, ty)
         b.panelIndex = i
         b:SetScript("OnClick", function() UI.SelectPanel(i) end)
         UI.tabButtons[i] = b
         tx = tx + b:GetWidth() + 4
     end
 
+    -- Layout below the tab block, derived from its final row.
+    local stripY = ty - 28          -- 22 tab height + 6 gap
+    local summaryY = stripY - 26
+    local headerY = summaryY - 20
+    local listTop = headerY - 20
+    f:SetHeight(-listTop + NUM_ROWS * ROW_H + 40)  -- 40 = footer + bottom inset
+
     -- Control strip (panel-specific controls live here)
     local strip = CreateFrame("Frame", nil, f)
-    strip:SetPoint("TOPLEFT", PAD, -152)
+    strip:SetPoint("TOPLEFT", PAD, stripY)
     strip:SetSize(INNER_W, 22)
     UI.controlStrip = strip
 
     -- Summary caption
     local summary = MakeText(f, "OVERLAY", "GameFontNormalSmall", "LEFT")
-    summary:SetPoint("TOPLEFT", PAD, -178)
+    summary:SetPoint("TOPLEFT", PAD, summaryY)
     summary:SetWidth(INNER_W)
     summary:SetText("")
     UI.summaryText = summary
 
     -- Column header buttons (sortable)
     local headerHost = CreateFrame("Frame", nil, f)
-    headerHost:SetPoint("TOPLEFT", PAD, -198)
+    headerHost:SetPoint("TOPLEFT", PAD, headerY)
     headerHost:SetSize(LIST_W, 18)
     UI.headerHost = headerHost
     UI.headerButtons = {}
@@ -1317,8 +1456,7 @@ function UI.Build()
         UI.headerButtons[i] = hb
     end
 
-    -- Scroll list
-    local listTop = -218
+    -- Scroll list (listTop computed off the tab block above)
     local scroll = CreateFrame("ScrollFrame", "AffixFinderUIScroll", f, "FauxScrollFrameTemplate")
     scroll:SetPoint("TOPLEFT", PAD, listTop)
     scroll:SetSize(LIST_W, NUM_ROWS * ROW_H)
@@ -1486,6 +1624,14 @@ function UI.UpdateFilterControlState()
     UI.bindSeg:SetEnabled(itemFiltersApply)
     setLabelEnabled(UI.forgeLabel, itemFiltersApply)
     setLabelEnabled(UI.bindLabel, itemFiltersApply)
+
+    -- The Instances tab is dungeons+raids by definition: World is locked out
+    -- there, but Dungeon/Raid keep working as filters (the bar must tell the
+    -- truth about what applies). Always set both ways so the disabled flag is
+    -- cleared again when leaving the tab.
+    UI.sourceSeg:SetEnabled(true)
+    UI.sourceSeg:SetButtonEnabled("world", not (panel and panel.instanceCategoriesOnly))
+    setLabelEnabled(UI.sourceLabel, true)
 
     if UI.classDD then
         if itemFiltersApply then
