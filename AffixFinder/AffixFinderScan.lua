@@ -551,11 +551,15 @@ local function forgeLevelRange(forgeFilter)
 end
 
 -- Forge filters are one-way thresholds: TF includes TF/WF/LF, WF includes
--- WF/LF, and LF includes only LF. Combine the included levels as mask unions,
--- not arithmetic sums, so one suffix family still counts only once.
+-- WF/LF, and LF includes only LF. Forged attunement is cumulative downward
+-- (LF also attunes WF/TF/base), so attuning ANY included level satisfies the
+-- threshold: possible masks union across levels (one suffix family counts
+-- once), but an affix is remaining only if it is unattuned at EVERY included
+-- level. This holds whether or not the server reports per-level progress
+-- inclusively, so it does not depend on that API detail.
 local function getFilteredAffixMasks(itemId, forgeFilter)
     local minLevel, maxLevel = forgeLevelRange(forgeFilter)
-    local possible1, possible2, remaining1, remaining2 = 0, 0, 0, 0
+    local possible1, possible2, attuned1, attuned2 = 0, 0, 0, 0
     for level = minLevel, maxLevel do
         local ok, levelPossible1, levelPossible2, levelRemaining1, levelRemaining2 =
             getRemainingAffixMasks(itemId, level)
@@ -564,10 +568,14 @@ local function getFilteredAffixMasks(itemId, forgeFilter)
         end
         possible1 = maskUnion(possible1, levelPossible1)
         possible2 = maskUnion(possible2, levelPossible2)
-        remaining1 = maskUnion(remaining1, levelRemaining1)
-        remaining2 = maskUnion(remaining2, levelRemaining2)
+        -- Attuned at this level = possible here minus remaining here. Tracking
+        -- attuned (not remaining) keeps affixes that are only possible at some
+        -- of the included levels from being dropped by the intersection.
+        attuned1 = maskUnion(attuned1, maskRemaining(levelPossible1, levelRemaining1))
+        attuned2 = maskUnion(attuned2, maskRemaining(levelPossible2, levelRemaining2))
     end
-    return true, possible1, possible2, remaining1, remaining2
+    return true, possible1, possible2,
+        maskRemaining(possible1, attuned1), maskRemaining(possible2, attuned2)
 end
 
 local function getAffixCounts(itemId, forgeFilter)
@@ -597,21 +605,21 @@ end
 local function itemIsUnattuned(itemId, forgeFilter)
     local minLevel, maxLevel = forgeLevelRange(forgeFilter)
 
-    -- A threshold remains useful while any included concrete tier is unfinished.
-    -- Higher forged attunes include all lower tiers, so LF progress also belongs
-    -- to the WF+ and TF+ filters.
+    -- Forged attunement is cumulative downward (LF also attunes WF/TF/base),
+    -- so finishing ANY included level satisfies the threshold. The item is
+    -- unattuned only when every included level is unfinished.
     local progressLevels = 0
     for level = minLevel, maxLevel do
         local progress = safeFirst(GetItemAttuneProgress, itemId, nil, level)
         if type(progress) == "number" then
             progressLevels = progressLevels + 1
-            if progress < 100 then
-                return true
+            if progress >= 100 then
+                return false
             end
         end
     end
     if progressLevels == (maxLevel - minLevel + 1) then
-        return false
+        return true
     end
 
     if minLevel == 0 and type(HasAttunedAnyVariantOfItem) == "function" then
@@ -624,11 +632,12 @@ local function itemIsUnattuned(itemId, forgeFilter)
     if type(GetItemAttuneForge) == "function" then
         local forge = safeFirst(GetItemAttuneForge, itemId)
         if type(forge) == "number" then
-            return forge < maxLevel
+            -- Any attained forge at or above the threshold's floor satisfies it.
+            return forge < minLevel
         end
     end
     if type(HasAttunedAnyVariantEx) == "function" then
-        local attuned = safeFirst(HasAttunedAnyVariantEx, itemId, maxLevel)
+        local attuned = safeFirst(HasAttunedAnyVariantEx, itemId, minLevel)
         if attuned ~= nil then
             return not (attuned == true or attuned == 1)
         end
