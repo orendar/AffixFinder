@@ -39,6 +39,11 @@ end
 -- 1-entry memo: OnTooltipSetItem can fire several times for one hover, and a
 -- bag full of items is hovered in quick succession, so cache the last lookup.
 local lastId, lastInfo
+function AF.InvalidateTooltipMemo()
+    lastId = nil
+    lastInfo = nil
+end
+
 local function affixInfoFor(itemId)
     if itemId == lastId then
         return lastInfo
@@ -53,7 +58,7 @@ local function addAffixLines(tooltip, link)
         return
     end
     -- Honour the toggle (Interface -> AddOns -> AffixFinder). Hooks stay
-    -- installed; we just skip the line when the player has turned it off.
+    -- installed, but no line is added when the player has turned it off.
     if AF.GetConfig and AF.GetConfig("tooltips") == false then
         return
     end
@@ -82,7 +87,7 @@ local function addAffixLines(tooltip, link)
             tonumber(s.spawnedCount) or 0), 0.8, 0.8, 0.8)
     end
 
-    tooltip:Show()  -- re-fit the tooltip to the lines we just added
+    tooltip:Show()  -- re-fit the tooltip after adding the AffixFinder lines
 end
 
 local function hookTooltip(tooltip)

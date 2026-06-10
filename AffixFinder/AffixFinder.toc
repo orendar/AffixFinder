@@ -2,10 +2,17 @@
 ## Title: AffixFinder
 ## Notes: Ranks where to farm Synastria item-affix attunements (per character or account). Requires the Synastria/WoWExt server APIs.
 ## Author: Oren
-## Version: 0.2.1
+## Version: 0.2.2
 ## SavedVariables: AffixFinderDB
 
 AffixFinder.lua
+AffixFinderScan.lua
+AffixFinderResist.lua
+AffixFinderWarp.lua
+AffixFinderZoneClassify.lua
+AffixFinderOutput.lua
+AffixFinderDebug.lua
+AffixFinderCommands.lua
 AffixFinderUI.lua
 AffixFinderConfig.lua
 AffixFinderTooltip.lua

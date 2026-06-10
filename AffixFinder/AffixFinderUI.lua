@@ -204,7 +204,7 @@ end
 -- Filters (data-driven; shared across every panel)
 -- ---------------------------------------------------------------------------
 -- scope/forge are single-select; bind/category/expansion are multi-select sets
--- (value -> true). Defaults: character, base forge, and everything else on.
+-- (value -> true). Defaults: character, non-forged, and everything else on.
 --
 -- scope/forge/bind are item-level: they change which items count, so they are
 -- part of the core's scan/cache key (changing one re-scans-or-hits-cache).
@@ -218,7 +218,7 @@ local EXPANSION_LABELS = { classic = "Classic", tbc = "TBC", wotlk = "WotLK" }
 
 UI.filters = {
     scope = "character",
-    forge = "base",
+    forge = "none",
     bind = { bop = true, boe = true },
     category = { dungeon = true, raid = true, world = true },
     expansion = { classic = true, tbc = true, wotlk = true },
@@ -240,11 +240,8 @@ UI.filters = {
 }
 
 local function CurrentForgeFilter()
-    local key = UI.filters.forge
-    if not key or key == "base" then
-        return nil
-    end
-    return AF.FORGE_FLAGS and AF.FORGE_FLAGS[key] or nil
+    local key = UI.filters.forge or "none"
+    return AF.FORGE_FLAGS and (AF.FORGE_FLAGS[key] or AF.FORGE_FLAGS.none) or nil
 end
 
 -- Reduce the bind set to core's single bindFilter: nil (both), "bop", or "boe".
@@ -301,7 +298,7 @@ local function FilterCaption()
         classNote = ", " .. AF.ClassDisplayName(UI.filters.class)
     end
     return scope
-        .. (ff and (", " .. ff.label) or "")
+        .. ", " .. tostring((ff and ff.label) or "None")
         .. (bindLabel and (", " .. bindLabel) or "")
         .. classNote
         .. setNote(UI.filters.category, CATEGORY_ORDER, CATEGORY_LABELS)
@@ -680,7 +677,8 @@ PANELS[#PANELS + 1] = {
                 tostring(e.bestMobName or "?"), tostring(e.bestMobZone or "?"), num(e.bestMobSpawns)) },
             { left = "  Mobs that drop it (this filter)", right = tostring(num(e.sourceMobs)) },
         }
-        local names = AF.GetRemainingAffixNames and AF.GetRemainingAffixNames(e.itemId, 10)
+        local names = AF.GetRemainingAffixNames
+            and AF.GetRemainingAffixNames(e.itemId, 10, CurrentForgeFilter())
         if names and #names > 0 then
             lines[#lines + 1] = { left = "  Suffixes still needed:" }
             for _, nm in ipairs(names) do
@@ -1032,7 +1030,7 @@ local function PanelSig(panel)
         return panel.dataSig(panel)
     end
     return "zone:" .. UI.filters.scope
-        .. ":" .. (UI.filters.forge or "base")
+        .. ":" .. (UI.filters.forge or "none")
         .. ":" .. (CurrentBindFilter() or "any")
 end
 
@@ -1132,9 +1130,9 @@ function UI.Build()
     forgeLabel:SetText("Forge:")
 
     local forgeSeg = CreateSegmented(f, {
-        { value = "base", text = "Base", width = 50 },
-        { value = "tf", text = "TF+", width = 44 },
-        { value = "wf", text = "WF+", width = 44 },
+        { value = "none", text = "None", width = 50 },
+        { value = "tf", text = "TF", width = 44 },
+        { value = "wf", text = "WF", width = 44 },
         { value = "lf", text = "LF", width = 40 },
     }, function(value)
         UI.filters.forge = value
