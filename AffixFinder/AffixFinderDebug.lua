@@ -850,6 +850,40 @@ local function printWarpDebug()
         REQUIRED_WARP_TIER, tostring(tier ~= nil and tier >= REQUIRED_WARP_TIER)))
 end
 
+-- /af forgedbg -- forge rarity + forge power probe. Shows exactly what the EV
+-- math will use, plus the raw API reads, so a wrong prestige/FP detection is
+-- visible in one paste.
+local function printForgeDebug()
+    chat("Forge debug -- per-drop forge roll rates used by EV math:")
+
+    local prestigedRaw = (type(_G.CMCGetMultiClassEnabled) == "function")
+        and safeFirst(_G.CMCGetMultiClassEnabled) or "unavailable"
+    local prestiged = tonumber(prestigedRaw) == 2
+    chat("  CMCGetMultiClassEnabled() = " .. tostring(prestigedRaw)
+        .. "  (2 = prestiged -> forge power applies)")
+
+    local fpRaw = (type(_G.GetCustomGameData) == "function")
+        and safeFirst(_G.GetCustomGameData, 29, 1494) or "unavailable"
+    local forgePower = AF.GetForgePower()
+    chat(string.format("  GetCustomGameData(29, 1494) = %s -> active forge power %.2f%% (multiplier x%.2f)",
+        tostring(fpRaw), forgePower, 1 + forgePower / 100))
+    if not prestiged then
+        chat("  (not prestiged: forge power is ignored, base rates apply)")
+    end
+
+    local rates = AF.FORGE_BASE_RATES
+    local mult = 1 + forgePower / 100
+    chat(string.format("  roll rates: TF %.3f%% / WF %.3f%% / LF %.3f%% (base %.1f%% / %.1f%% / %.1f%%)",
+        rates[1] * mult * 100, rates[2] * mult * 100, rates[3] * mult * 100,
+        rates[1] * 100, rates[2] * 100, rates[3] * 100))
+
+    for _, key in ipairs({ "none", "tf", "wf", "lf" }) do
+        local filter = AF.FORGE_FLAGS[key]
+        chat(string.format("  %s threshold (%s): %.3f%% of drops qualify",
+            key, filter.label, AF.GetForgeDropChance(filter, forgePower) * 100))
+    end
+end
+
 local function printMemReport()
     local addonKb
     if type(UpdateAddOnMemoryUsage) == "function" and type(GetAddOnMemoryUsage) == "function" then
@@ -885,6 +919,7 @@ end
 I.Debug = {
     printAffixDebug = printAffixDebug,
     printAffixIdProbe = printAffixIdProbe,
+    printForgeDebug = printForgeDebug,
     printDebugItem = printDebugItem,
     printSourceRawDump = printSourceRawDump,
     printMemReport = printMemReport,

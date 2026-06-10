@@ -80,6 +80,13 @@ local FORGE_FLAGS = {
 -- accepts without duplicating the table. `base` remains an alias for `none`.
 AF.FORGE_FLAGS = FORGE_FLAGS
 
+-- Chance that one dropped item rolls AT each forge level (Synastria base
+-- rates, before forge power): TF 5%, WF 0.7%, LF 0.1%. The remaining ~94.2%
+-- of drops are unforged. Forge EV math must weight forged thresholds by these
+-- -- a TF+ drop is ~17x rarer than "any drop".
+local FORGE_BASE_RATES = { [1] = 0.05, [2] = 0.007, [3] = 0.001 }
+AF.FORGE_BASE_RATES = FORGE_BASE_RATES
+
 -- ItemLocGetSourceAt row classification (file-locals, mirroring qtRunner).
 --   srcType   1 = creature loot, 2 = quest reward, 9 = vendor, 5..13 = crafting
 --   srcObjType 0 = creature/NPC
@@ -166,6 +173,50 @@ local function isCustomReady()
     end
 
     return true
+end
+
+
+-- Forge Power (FP): a prestige stat that multiplies every forge proc rate by
+-- (1 + FP/100) -- 100% FP doubles them (10% TF / 1.4% WF / 0.2% LF). Only
+-- prestiged characters have it: CMCGetMultiClassEnabled() == 2 marks prestige,
+-- and GetCustomGameData(29, 1494) returns the active FP percent (the same
+-- reads ScootsStats uses for its Forge Power stat line). Returns 0 for
+-- non-prestiged characters or when the APIs are unavailable.
+function AF.GetForgePower()
+    local prestiged = tonumber(safeFirst(_G.CMCGetMultiClassEnabled)) or 1
+    if prestiged ~= 2 then
+        return 0
+    end
+    local fp = tonumber(safeFirst(_G.GetCustomGameData, 29, 1494))
+    if not fp or fp < 0 then
+        return 0
+    end
+    return fp
+end
+
+-- Probability that one dropped copy of an item rolls at or above the filter's
+-- forge floor. Forge filters are one-way thresholds (TF+ = levels 1..3), and
+-- attuning ANY included level satisfies the threshold, so the qualifying mass
+-- is the SUM of the included levels' roll rates, scaled by forge power.
+-- The base filter returns 1: every drop, forged or not, attunes base affixes.
+-- forgePower (percent) is optional; omitted = read live via AF.GetForgePower().
+function AF.GetForgeDropChance(forgeFilter, forgePower)
+    local minLevel = tonumber(forgeFilter and (forgeFilter.minLevel or forgeFilter.level)) or 0
+    if minLevel <= 0 then
+        return 1
+    end
+    local chance = 0
+    for level = minLevel, 3 do
+        chance = chance + (FORGE_BASE_RATES[level] or 0)
+    end
+    local fp = tonumber(forgePower)
+    if fp == nil then
+        fp = AF.GetForgePower()
+    end
+    if fp > 0 then
+        chance = chance * (1 + fp / 100)
+    end
+    return math.min(chance, 1)
 end
 
 

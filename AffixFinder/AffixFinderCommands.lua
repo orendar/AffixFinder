@@ -22,6 +22,7 @@ local printSourceRawDump = Debug.printSourceRawDump
 local printAffixIdProbe = Debug.printAffixIdProbe
 local printResistValue = Debug.printResistValue
 local printWarpDebug = Debug.printWarpDebug
+local printForgeDebug = Debug.printForgeDebug
 local printMemReport = Debug.printMemReport
 
 -- ---------------------------------------------------------------------------
@@ -77,6 +78,8 @@ local function parseOptions(msg)
             options.mode = "zonedump"
         elseif token == "warp" or token == "warpdbg" then
             options.mode = "warpdbg"
+        elseif token == "forgedbg" or token == "forgepower" or token == "fp" then
+            options.mode = "forgedbg"
         elseif token == "affixdbg" or token == "maskdbg" then
             options.mode = "affixdbg"
             options.affixDbg = true
@@ -159,6 +162,7 @@ local function printUsage()
     chat("Debug: /af debug <itemId|link> [maxRows], /af zonedbg (zone classification)")
     chat("  /af zonedump [char|acc] [none|tf|wf|lf] [bop|boe|both] [sampleRows] (current-zone item gates)")
     chat("  /af warp (current-zone T3 warp-tier probe for the map-warp assist)")
+    chat("  /af forgedbg (forge roll rates + prestige forge power used by EV math)")
     chat("  /af affixdbg <itemId|link> [none|tf|wf|lf] [maxBits] (forge-level affix mask probe)")
     chat("  /af affixid <item link> (rolled affix id + ItemAttuneAffix key scheme)")
     chat("  /af srcdbg <itemId|link> [maxRows] (raw source-row returns, incl. undocumented fields)")
@@ -229,6 +233,8 @@ SlashCmdList["AFFIXFINDER"] = function(msg)
         printZoneItemDump(options)
     elseif options.mode == "warpdbg" then
         printWarpDebug()
+    elseif options.mode == "forgedbg" then
+        printForgeDebug()
     elseif options.mode == "instances" then
         printInstanceRankings(options)
     elseif options.mode == "zones" and options.ev then

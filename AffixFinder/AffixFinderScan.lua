@@ -1238,6 +1238,14 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
         -- source rows, no strings beyond category); mobs carry the id lists.
         local itemsById = {}
         local affixedItemsScanned = 0
+        -- Source rows report the chance the item drops AT ALL; a forged slice
+        -- only cares about the copies that roll at/above the threshold's floor
+        -- (TF+ ~5.8% of drops at 0 FP). One scan-wide factor: it depends only
+        -- on the filter and the character's forge power, not the item. FP is
+        -- snapshotted here -- it only changes on prestige, and slices go dirty
+        -- on every attune anyway.
+        local forgePower = AF.GetForgePower()
+        local forgeDropChance = AF.GetForgeDropChance(forgeFilter, forgePower)
         local progress = makeProgress("mob sources")
         -- Per-class breakdown only matters in account scope (character scope is
         -- already a single class); skip the work otherwise.
@@ -1362,7 +1370,7 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
                         }
                         mobsByKey[mobKey] = mob
                     end
-                    local evDelta = src.dropProbability * valuePerDrop
+                    local evDelta = src.dropProbability * forgeDropChance * valuePerDrop
                     mob.evPerKill = mob.evPerKill + evDelta
                     mob.itemsDropped = mob.itemsDropped + 1
                     mob.affixesLeft = mob.affixesLeft + affixesLeft
@@ -1391,6 +1399,10 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
                 forgeFilter = forgeFilter,
                 bindFilter = bindFilter,
                 includeMythics = includeMythics,
+                -- Snapshotted forge-rarity factor baked into every evPerKill
+                -- above (1 for the base filter); kept for captions/debug.
+                forgePower = forgePower,
+                forgeDropChance = forgeDropChance,
                 rows = rows,
                 rowsByZone = rowsByZone,
                 mobsByKey = mobsByKey,
