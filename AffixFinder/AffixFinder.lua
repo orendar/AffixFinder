@@ -67,18 +67,17 @@ function AF.GetConfig(key)
     return value
 end
 
-local FORGE_NONE = { level = 0, label = "None" }
+local FORGE_NONE = { level = 0, minLevel = 0, maxLevel = 0, label = "None" }
 local FORGE_FLAGS = {
     none = FORGE_NONE,
     base = FORGE_NONE,
-    tf = { level = 1, label = "Titanforged" },
-    wf = { level = 2, label = "Warforged" },
-    lf = { level = 3, label = "Lightforged" },
+    tf = { level = 1, minLevel = 1, maxLevel = 3, label = "Titanforged+" },
+    wf = { level = 2, minLevel = 2, maxLevel = 3, label = "Warforged+" },
+    lf = { level = 3, minLevel = 3, maxLevel = 3, label = "Lightforged" },
 }
 
--- Exposed so the UI can present the same exact forge-level filters the slash
--- command accepts without duplicating the table. `base` remains an alias for
--- `none` for backwards-compatible slash usage.
+-- Exposed so the UI can present the same forge thresholds the slash command
+-- accepts without duplicating the table. `base` remains an alias for `none`.
 AF.FORGE_FLAGS = FORGE_FLAGS
 
 -- ItemLocGetSourceAt row classification (file-locals, mirroring qtRunner).

@@ -60,6 +60,20 @@ local function maskRemaining(possibleMask, attunedMask)
     return bitAnd(possibleMask or 0, bitNot32(attunedMask or 0))
 end
 
+local function uint32(value)
+    value = tonumber(value) or 0
+    if value < 0 then
+        value = value + 4294967296
+    end
+    return value
+end
+
+local function maskUnion(a, b)
+    a = uint32(a)
+    b = uint32(b)
+    return a + b - uint32(bitAnd(a, b))
+end
+
 -- ---------------------------------------------------------------------------
 -- Breakdown / text helpers
 -- ---------------------------------------------------------------------------
@@ -527,20 +541,44 @@ local function getRemainingAffixMasks(itemId, forgeLevel)
         remainingWord(possible2, attuned2, 32)
 end
 
-local function getMaskAffixCounts(itemId, forgeLevel)
+local function forgeLevelRange(forgeFilter)
+    local minLevel = tonumber(forgeFilter and (forgeFilter.minLevel or forgeFilter.level)) or 0
+    if minLevel <= 0 then
+        return 0, 0
+    end
+    local maxLevel = tonumber(forgeFilter and forgeFilter.maxLevel) or 3
+    return minLevel, math.max(minLevel, math.min(maxLevel, 3))
+end
+
+-- Forge filters are one-way thresholds: TF includes TF/WF/LF, WF includes
+-- WF/LF, and LF includes only LF. Combine the included levels as mask unions,
+-- not arithmetic sums, so one suffix family still counts only once.
+local function getFilteredAffixMasks(itemId, forgeFilter)
+    local minLevel, maxLevel = forgeLevelRange(forgeFilter)
+    local possible1, possible2, remaining1, remaining2 = 0, 0, 0, 0
+    for level = minLevel, maxLevel do
+        local ok, levelPossible1, levelPossible2, levelRemaining1, levelRemaining2 =
+            getRemainingAffixMasks(itemId, level)
+        if not ok then
+            return false
+        end
+        possible1 = maskUnion(possible1, levelPossible1)
+        possible2 = maskUnion(possible2, levelPossible2)
+        remaining1 = maskUnion(remaining1, levelRemaining1)
+        remaining2 = maskUnion(remaining2, levelRemaining2)
+    end
+    return true, possible1, possible2, remaining1, remaining2
+end
+
+local function getAffixCounts(itemId, forgeFilter)
     local ok, possible1, possible2, remaining1, remaining2 =
-        getRemainingAffixMasks(itemId, forgeLevel)
+        getFilteredAffixMasks(itemId, forgeFilter)
     if not ok then
         return 0, 0
     end
     local possible = countBits32(possible1) + countBits32(possible2)
     local left = countBits32(remaining1) + countBits32(remaining2)
     return possible, left
-end
-
-local function getAffixCounts(itemId, forgeFilter)
-    local level = forgeFilter and tonumber(forgeFilter.level) or 0
-    return getMaskAffixCounts(itemId, level)
 end
 
 local function getDropProbability(chance, dropsPerThousand)
@@ -557,21 +595,26 @@ local function getDropProbability(chance, dropsPerThousand)
 end
 
 local function itemIsUnattuned(itemId, forgeFilter)
-    local level = forgeFilter and tonumber(forgeFilter.level) or 0
+    local minLevel, maxLevel = forgeLevelRange(forgeFilter)
 
-    -- The progress API accepts the concrete 0..3 forge level, so prefer it over
-    -- GetItemAttuneForge's highest-attuned-level summary.
-    local progress = safeFirst(GetItemAttuneProgress, itemId, nil, level)
-    if type(progress) == "number" then
-        return progress < 100
-    end
-    if type(HasAttunedAnyVariantEx) == "function" then
-        local attuned = safeFirst(HasAttunedAnyVariantEx, itemId, level)
-        if attuned ~= nil then
-            return not (attuned == true or attuned == 1)
+    -- A threshold remains useful while any included concrete tier is unfinished.
+    -- Higher forged attunes include all lower tiers, so LF progress also belongs
+    -- to the WF+ and TF+ filters.
+    local progressLevels = 0
+    for level = minLevel, maxLevel do
+        local progress = safeFirst(GetItemAttuneProgress, itemId, nil, level)
+        if type(progress) == "number" then
+            progressLevels = progressLevels + 1
+            if progress < 100 then
+                return true
+            end
         end
     end
-    if level == 0 and type(HasAttunedAnyVariantOfItem) == "function" then
+    if progressLevels == (maxLevel - minLevel + 1) then
+        return false
+    end
+
+    if minLevel == 0 and type(HasAttunedAnyVariantOfItem) == "function" then
         local attuned = safeFirst(HasAttunedAnyVariantOfItem, itemId)
         if attuned ~= nil then
             return not (attuned == true or attuned == 1)
@@ -581,7 +624,13 @@ local function itemIsUnattuned(itemId, forgeFilter)
     if type(GetItemAttuneForge) == "function" then
         local forge = safeFirst(GetItemAttuneForge, itemId)
         if type(forge) == "number" then
-            return forge < level
+            return forge < maxLevel
+        end
+    end
+    if type(HasAttunedAnyVariantEx) == "function" then
+        local attuned = safeFirst(HasAttunedAnyVariantEx, itemId, maxLevel)
+        if attuned ~= nil then
+            return not (attuned == true or attuned == 1)
         end
     end
     return false
@@ -814,8 +863,7 @@ function AF.GetRemainingAffixNames(itemId, limit, forgeFilter)
     if type(GetItemAffixMask) ~= "function" then
         return nil
     end
-    local level = forgeFilter and tonumber(forgeFilter.level) or 0
-    local ok, p1, p2, remaining1, remaining2 = getRemainingAffixMasks(itemId, level)
+    local ok, p1, p2, remaining1, remaining2 = getFilteredAffixMasks(itemId, forgeFilter)
     if not ok then
         return nil
     end
@@ -870,7 +918,7 @@ function AF.GetItemAffixInfo(itemId, minSpawns)
     if isIgnoredMeleeWeaponId(itemId) then
         return nil
     end
-    local possible, left = getMaskAffixCounts(itemId)
+    local possible, left = getAffixCounts(itemId, nil)
     if possible <= 0 then
         return nil
     end

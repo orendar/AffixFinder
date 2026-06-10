@@ -1131,8 +1131,8 @@ function UI.Build()
 
     local forgeSeg = CreateSegmented(f, {
         { value = "none", text = "None", width = 50 },
-        { value = "tf", text = "TF", width = 44 },
-        { value = "wf", text = "WF", width = 44 },
+        { value = "tf", text = "TF+", width = 44 },
+        { value = "wf", text = "WF+", width = 44 },
         { value = "lf", text = "LF", width = 40 },
     }, function(value)
         UI.filters.forge = value

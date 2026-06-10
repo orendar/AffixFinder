@@ -155,7 +155,7 @@ local function printUsage()
     chat("  /af affixid <item link> (rolled affix id + ItemAttuneAffix key scheme)")
     chat("  /af resistval <item link> (actual resist amount + scaling probe)")
     chat("Maintenance: /af clearcache (reset + rediscover), /af mem (memory report)")
-    chat("Forge filters are exact levels: none=0, tf=1, wf=2, lf=3.")
+    chat("Forge filters are thresholds: tf=TF/WF/LF, wf=WF/LF, lf=LF; suffixes are counted once.")
     chat("Counts cover affixes obtainable from killable mobs. First zone command")
     chat("scans for a few seconds, then results are cached until you attune or clear.")
 end

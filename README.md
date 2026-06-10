@@ -76,7 +76,8 @@ AffixFinder does not save the full item graph or ranking results. It only persis
 ## Notes
 
 - Scope can be **Character** or **Account**.
-- Forge filters select one exact item level: **None**, **Titanforged**, **Warforged**, or **Lightforged**.
+- Forge filters are one-way thresholds: **None** is base only, **TF+** includes Titanforged/Warforged/Lightforged, **WF+** includes Warforged/Lightforged, and **LF** includes Lightforged only.
+- Forged attunement is cumulative downward: TF also attunes the base affix, WF also attunes TF and base, and LF also attunes WF, TF, and base. AffixFinder unions the included tiers, so a suffix available at several forge levels is counted once rather than multiplied.
 - Bind filters can include BoP, BoE, or both.
 - Melee weapons are ignored because their random affixes do not contribute attuned stats on Synastria. Ranged weapons, wands, and shields are still counted.
 - Resistance values are estimates based on item level, because the exact rolled suffix value is not available during scans.
