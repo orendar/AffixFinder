@@ -434,7 +434,14 @@ end
 -- `label` / `placeholderText` label it. `withCurr` adds the current-zone button
 -- (only meaningful for a zone search). Used by the Mobs and Items panels; sets
 -- panel._edit / panel._searchEdit / panel._searchKey / panel._updatePlaceholder.
-local function BuildSearchSpawnControls(panel, strip, label, filterKey, placeholderText, withCurr)
+--
+-- `withDensity` swaps the trailing min-spawns hint text for a pack-density
+-- threshold cycle button (Any -> Fair+ -> Good+ -> Excellent), driving
+-- panel.minDensity (display-time, like minSpawns -- never rescans). The
+-- density data needs Questie; mobs with unknown density always pass.
+local DENSITY_FILTER_LABELS = { [0] = "any", [1] = "fair+", [2] = "good+", [3] = "excellent" }
+
+local function BuildSearchSpawnControls(panel, strip, label, filterKey, placeholderText, withCurr, withDensity)
     panel.minSpawns = AF.GetConfig("minSpawns")  -- seed from the saved default
     panel._searchKey = filterKey
 
@@ -545,9 +552,39 @@ local function BuildSearchSpawnControls(panel, strip, label, filterKey, placehol
     edit:SetScript("OnEnterPressed", commit)
     edit:SetScript("OnEditFocusLost", commit)
 
-    local hint = MakeText(strip, "OVERLAY", "GameFontDisableSmall")
-    hint:SetPoint("LEFT", edit, "RIGHT", 8, 0)
-    hint:SetText("(0 = include sparse mobs)")
+    if withDensity then
+        -- Density threshold cycle button in the hint's spot (the strip is a
+        -- single 22px row with no width to spare for both).
+        panel.minDensity = tonumber(AF.GetConfig("minDensity")) or 0
+
+        local densityBtn = CreateFrame("Button", nil, strip, "UIPanelButtonTemplate")
+        densityBtn:SetSize(118, 18)
+        densityBtn:SetPoint("LEFT", edit, "RIGHT", 8, 0)
+        local function densityText()
+            return "Density: " .. (DENSITY_FILTER_LABELS[panel.minDensity or 0] or "any")
+        end
+        densityBtn:SetText(densityText())
+        densityBtn:SetScript("OnClick", function(s)
+            panel.minDensity = ((panel.minDensity or 0) + 1) % 4
+            panel._userSetDensity = true  -- stop following the saved default this session
+            s:SetText(densityText())
+            UI.RefreshActivePanel()
+        end)
+        densityBtn:SetScript("OnEnter", function(s)
+            GameTooltip:SetOwner(s, "ANCHOR_TOP")
+            GameTooltip:AddLine("Minimum pack density", 1, 1, 1)
+            GameTooltip:AddLine("How tightly this mob's best camp of Min-spawns points is packed (walk per kill, from Questie spawn data). Click to cycle: any, fair+, good+, excellent.", 0.8, 0.8, 0.8, true)
+            GameTooltip:AddLine("Mobs with unknown density (no Questie data) always show.", 0.8, 0.8, 0.8, true)
+            GameTooltip:Show()
+        end)
+        densityBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        panel._densityBtn = densityBtn
+        panel._densityText = densityText
+    else
+        local hint = MakeText(strip, "OVERLAY", "GameFontDisableSmall")
+        hint:SetPoint("LEFT", edit, "RIGHT", 8, 0)
+        hint:SetText("(0 = include sparse mobs)")
+    end
 
     panel._edit = edit
     panel._searchEdit = zoneEdit
@@ -556,6 +593,7 @@ end
 
 local function SyncSearchSpawnControls(panel)
     if panel._edit then panel._edit:SetText(tostring(panel.minSpawns)) end
+    if panel._densityBtn then panel._densityBtn:SetText(panel._densityText()) end
     if panel._searchEdit then
         panel._searchEdit:SetText(UI.filters[panel._searchKey] or "")
         if panel._updatePlaceholder then panel._updatePlaceholder() end
@@ -675,7 +713,18 @@ PANELS[#PANELS + 1] = {
           value = function(e) return num(e.itemsDropped) end },
     },
     getRows = function(data, panel)
-        local rows = AF.BuildMobList(data, panel.minSpawns, UI.filters.class)
+        local rows, pendingDensity = AF.BuildMobList(data, panel.minSpawns, UI.filters.class, panel.minDensity)
+        -- Density geometry is computed in a time-budgeted background worker so
+        -- the client never freezes: not-yet-known mobs stay visible, and the
+        -- list re-renders (tightens) once the worker drains the queue.
+        panel._densityPending = pendingDensity and #pendingDensity or 0
+        if pendingDensity and type(AF.RequestMobDensities) == "function" then
+            AF.RequestMobDensities(pendingDensity, function()
+                if UI.frame and UI.frame:IsShown() then
+                    UI.RefreshActivePanel()
+                end
+            end)
+        end
         -- Mobs-only zone filter (case-insensitive substring on zoneName). The
         -- shared category/expansion pass in RefreshActivePanel still applies on
         -- top of this; the Zones list itself is never narrowed.
@@ -698,8 +747,17 @@ PANELS[#PANELS + 1] = {
         local warpPart = AF.GetConfig("automaticWarp") and " -- click a mob to pin/open map" or " -- click a mob to pin it"
         local what = AttuneMode() and "expected new item attunes"
             or "expected useful affix drops"
-        return string.format("%d mobs%s (%s; min spawns %d) -- %s per 1000 kills%s",
-            n, zonePart, FilterCaption(), panel.minSpawns, what, warpPart)
+        local densityPart = ""
+        if (panel.minDensity or 0) > 0 then
+            densityPart = string.format("; density %s+",
+                AF.DENSITY_GRADE_BY_RANK and AF.DENSITY_GRADE_BY_RANK[panel.minDensity] or panel.minDensity)
+            if (panel._densityPending or 0) > 0 then
+                densityPart = densityPart .. string.format(
+                    " (computing %d in background...)", panel._densityPending)
+            end
+        end
+        return string.format("%d mobs%s (%s; min spawns %d%s) -- %s per 1000 kills%s",
+            n, zonePart, FilterCaption(), panel.minSpawns, densityPart, what, warpPart)
     end,
     onRowClick = function(entry)
         if AF.TryWarpToMob then
@@ -725,6 +783,21 @@ PANELS[#PANELS + 1] = {
                 { left = "  Remaining affixes across those items", right = tostring(num(e.affixesLeft)) },
             }
         end
+        local d = e.density
+        if d then
+            local camp = d.camp
+            if d.points == 1 then
+                lines[#lines + 1] = { left = "  Pack density", right = "single spawn point" }
+            elseif camp then
+                local label = "  Pack density (best camp of " .. camp.size
+                    .. (camp.short and ", all that's mapped)" or ")")
+                lines[#lines + 1] = { left = label,
+                    right = string.format("%s (%.1f%%/kill)", camp.grade, camp.walkPerKill) }
+            else
+                lines[#lines + 1] = { left = "  Pack density",
+                    right = string.format("%s (%.1f%%/kill)", d.grade, d.walkPerKill or 0) }
+            end
+        end
         if AF.GetConfig("automaticWarp") then
             lines[#lines + 1] = { left = "  Click", right = "pin latest target and open t3 map" }
         else
@@ -733,7 +806,7 @@ PANELS[#PANELS + 1] = {
         return lines
     end,
     buildControls = function(panel, strip)
-        BuildSearchSpawnControls(panel, strip, "Zone:", "zone", "all zones", true)
+        BuildSearchSpawnControls(panel, strip, "Zone:", "zone", "all zones", true, true)
     end,
     syncControls = SyncSearchSpawnControls,
 }
@@ -2115,6 +2188,10 @@ function UI.ApplyConfig()
         if (p.id == "mobs" or p.id == "resist" or p.id == "items") and not p._userSetSpawns then
             p.minSpawns = AF.GetConfig("minSpawns")
             if p._edit then p._edit:SetText(tostring(p.minSpawns)) end
+        end
+        if p.id == "mobs" and not p._userSetDensity then
+            p.minDensity = tonumber(AF.GetConfig("minDensity")) or 0
+            if p._densityBtn then p._densityBtn:SetText(p._densityText()) end
         end
     end
     if UI.frame and UI.frame:IsShown() then

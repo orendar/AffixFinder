@@ -89,13 +89,32 @@ local function SetRegionText(frameName, suffix, text)
     return region
 end
 
-local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+-- The settings outgrew the Interface Options canvas (which never scrolls), so
+-- every widget lives on a scroll child instead of the panel itself. The
+-- template provides scrollbar + mouse-wheel handling; the child's width
+-- tracks the visible area (set on size change) and its height is fixed to
+-- the content's extent after the last widget below.
+local scroll = CreateFrame("ScrollFrame", "AffixFinderOptionsScroll", panel,
+    "UIPanelScrollFrameTemplate")
+scroll:SetPoint("TOPLEFT", 0, -4)
+scroll:SetPoint("BOTTOMRIGHT", -28, 4)  -- leave room for the scrollbar
+
+local content = CreateFrame("Frame", "AffixFinderOptionsContent", scroll)
+content:SetSize(600, 620)  -- height = content extent; width corrected below
+scroll:SetScrollChild(content)
+scroll:SetScript("OnSizeChanged", function(self, width)
+    if width and width > 0 then
+        content:SetWidth(width)
+    end
+end)
+
+local title = content:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
 title:SetPoint("TOPLEFT", 16, -16)
 title:SetText("AffixFinder")
 
-local subtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+local subtitle = content:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
-subtitle:SetPoint("RIGHT", panel, "RIGHT", -32, 0)
+subtitle:SetPoint("RIGHT", content, "RIGHT", -32, 0)
 subtitle:SetHeight(34)
 subtitle:SetJustifyH("LEFT")
 subtitle:SetJustifyV("TOP")
@@ -103,7 +122,7 @@ subtitle:SetText("Settings for affix-attunement scanning. These persist across s
     .. "everything else the addon keeps stays in memory only.")
 
 -- --- Include mythics (checkbox) --------------------------------------------
-local mythic = CreateFrame("CheckButton", "AffixFinderMythicCheck", panel,
+local mythic = CreateFrame("CheckButton", "AffixFinderMythicCheck", content,
     "InterfaceOptionsCheckButtonTemplate")
 mythic:SetPoint("TOPLEFT", subtitle, "BOTTOMLEFT", 0, -16)
 SetRegionText(mythic:GetName(), "Text", "Include mythic items in calculations")
@@ -115,7 +134,7 @@ mythic:SetScript("OnClick", function(self)
 end)
 
 -- --- Automatic warp (checkbox) --------------------------------------------
-local autoWarp = CreateFrame("CheckButton", "AffixFinderAutoWarpCheck", panel,
+local autoWarp = CreateFrame("CheckButton", "AffixFinderAutoWarpCheck", content,
     "InterfaceOptionsCheckButtonTemplate")
 autoWarp:SetPoint("TOPLEFT", mythic, "BOTTOMLEFT", 0, -10)
 SetRegionText(autoWarp:GetName(), "Text", "T3 map-warp assist from the Mobs view")
@@ -128,7 +147,7 @@ autoWarp:SetScript("OnClick", function(self)
 end)
 
 -- --- Item tooltips (checkbox) ----------------------------------------------
-local tooltips = CreateFrame("CheckButton", "AffixFinderTooltipsCheck", panel,
+local tooltips = CreateFrame("CheckButton", "AffixFinderTooltipsCheck", content,
     "InterfaceOptionsCheckButtonTemplate")
 tooltips:SetPoint("TOPLEFT", autoWarp, "BOTTOMLEFT", 0, -10)
 SetRegionText(tooltips:GetName(), "Text", "Add affix info to item tooltips")
@@ -144,7 +163,7 @@ end)
 -- We fold the live value into $parentText so the current setting is always shown
 -- above the slider, and commit on change (rounded to the step).
 local function BuildSlider(name, labelText, minV, maxV, step, formatValue, configKey, anchor, yGap)
-    local s = CreateFrame("Slider", name, panel, "OptionsSliderTemplate")
+    local s = CreateFrame("Slider", name, content, "OptionsSliderTemplate")
     s:SetWidth(300)
     s:SetHeight(16)
     s:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 4, yGap)
@@ -201,6 +220,31 @@ spawnSlider.tooltipText = "Default minimum reported spawn count for a mob to app
     .. "view. Higher hides rare/sparse spawns; 0 includes everything. You can still override this "
     .. "per session in the window."
 
+local DENSITY_SLIDER_LABELS = { [0] = "any", [1] = "fair or better", [2] = "good or better", [3] = "excellent only" }
+local densitySlider = BuildSlider(
+    "AffixFinderDensitySlider",
+    "Default minimum pack density",
+    0, 3, 1,
+    function(v) return DENSITY_SLIDER_LABELS[v] or tostring(v) end,
+    "minDensity",
+    spawnSlider, -48)
+densitySlider.tooltipText = "Default pack-density threshold for the Mobs view: how tightly a mob's "
+    .. "best camp of Min-spawns spawn points is packed (walk distance per kill, computed from "
+    .. "Questie's spawn data). Mobs whose density is unknown (Questie not loaded, or no data for "
+    .. "that NPC) always show. You can still override this per session in the window."
+
+local speedSlider = BuildSlider(
+    "AffixFinderSpeedSlider",
+    "Scan speed",
+    2, 16, 1,
+    function(v) return v .. " ms per frame" end,
+    "scanBudget",
+    densitySlider, -48)
+speedSlider.tooltipText = "How much of each frame the background scans (discovery, zone/resist/"
+    .. "new-item scans, pack density) may use. Higher finishes scans sooner at the cost of frame "
+    .. "rate while they run; lower is smoother but slower. 10 is the default; drop to 3-6 for "
+    .. "maximum smoothness."
+
 -- ---------------------------------------------------------------------------
 -- Reflect AF.config in the widgets
 -- ---------------------------------------------------------------------------
@@ -211,17 +255,22 @@ local function RefreshWidgets()
     tooltips:SetChecked(AF.GetConfig("tooltips") ~= false)
 
     -- Guard against the OnValueChanged handler writing back while we load.
-    rescanSlider._loading, spawnSlider._loading = true, true
-    rescanSlider:SetValue(AF.GetConfig("rescanInterval"))
-    spawnSlider:SetValue(AF.GetConfig("minSpawns"))
-    rescanSlider._loading, spawnSlider._loading = false, false
+    local sliders = {
+        { rescanSlider, "rescanInterval" },
+        { spawnSlider, "minSpawns" },
+        { densitySlider, "minDensity" },
+        { speedSlider, "scanBudget" },
+    }
+    for _, s in ipairs(sliders) do s[1]._loading = true end
+    for _, s in ipairs(sliders) do s[1]:SetValue(AF.GetConfig(s[2])) end
+    for _, s in ipairs(sliders) do s[1]._loading = false end
 
     -- SetValue does not fire OnValueChanged when the value is unchanged, so set
     -- the labels explicitly to keep them correct.
-    rescanSlider.setLabel(AF.GetConfig("rescanInterval"))
-    spawnSlider.setLabel(AF.GetConfig("minSpawns"))
-    rescanSlider._lastSaved = AF.GetConfig("rescanInterval")
-    spawnSlider._lastSaved = AF.GetConfig("minSpawns")
+    for _, s in ipairs(sliders) do
+        s[1].setLabel(AF.GetConfig(s[2]))
+        s[1]._lastSaved = AF.GetConfig(s[2])
+    end
 end
 
 panel:SetScript("OnShow", RefreshWidgets)

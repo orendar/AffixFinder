@@ -430,13 +430,15 @@ local function itemHasRandomAffix(itemId)
     return false
 end
 
+-- One API call per item, not two: this gate runs once per item in EVERY
+-- scan's hot loop (affix, resist, attune), so each scope must pay only its
+-- own API -- account scope needs IsAttunableBySomeone alone, never an
+-- unused CanAttuneItemHelper call (regression-tested).
 local function itemMatchesScope(itemId, scope)
-    local canCharacter = (safeFirst(CanAttuneItemHelper, itemId) or 0) > 0
     if scope == "character" then
-        return canCharacter
+        return (safeFirst(CanAttuneItemHelper, itemId) or 0) > 0
     end
-    local canSomeone = (safeFirst(IsAttunableBySomeone, itemId) or 0) ~= 0
-    return canSomeone
+    return (safeFirst(IsAttunableBySomeone, itemId) or 0) ~= 0
 end
 
 -- GetItemAffixMask bits are ItemAttuneAffix.index values, while
@@ -1007,10 +1009,18 @@ local profileMs = (type(debugprofilestop) == "function") and debugprofilestop or
 -- Runs stepFn(i) for i = 1..total across frames, capped per frame by a time
 -- budget (budgetMs) so the client stays responsive regardless of per-item cost,
 -- then calls doneFn(). progressFn(done, total) is called occasionally.
+--
+-- Throughput = budgetMs x framerate, so the budget is the scan-speed knob:
+-- the default comes from the `scanBudget` setting (ms per frame; higher =
+-- faster scans, more frame-time spent). The per-frame item cap is only a
+-- runaway guard for clients WITHOUT debugprofilestop -- when the timer
+-- exists, the budget governs, and a low cap would throttle cheap steps on
+-- fast machines (5000 one-call discovery steps can finish well inside the
+-- budget, idling the rest of the frame allowance).
 local function runChunked(total, stepFn, doneFn, progressFn, budgetMs, perFrameCap)
     total = total or 0
-    budgetMs = budgetMs or 6
-    perFrameCap = perFrameCap or 5000
+    budgetMs = budgetMs or tonumber(AF.GetConfig("scanBudget")) or 6
+    perFrameCap = perFrameCap or (profileMs and 100000 or 5000)
     if total <= 0 then
         doneFn()
         return
@@ -1711,15 +1721,55 @@ end
 --
 -- classToken (optional, account scope) restricts every per-mob value to a
 -- single class (and drops mobs that drop nothing for that class). nil = account.
-function AF.BuildMobList(data, minSpawns, classToken)
+--
+-- minDensityRank (optional, 1-3 vs AF.DENSITY_GRADE_BY_RANK; nil/0 = off)
+-- drops mobs whose BEST CAMP density (the densest minSpawns-sized pocket of
+-- Questie spawn points -- see AF.GetMobDensity in AffixFinderWarp.lua) grades
+-- below the rank. Mobs with UNKNOWN density (no Questie / no spawn data) are
+-- KEPT: missing data is not evidence of sparseness, and without Questie the
+-- filter would otherwise silently empty the list. Each kept row gets a
+-- display-only `density` field (the shared memoized geometry table, nil when
+-- unknown) so views can show the grade without recomputing.
+--
+-- NEVER computes geometry: it only PEEKS the density memo (computing a whole
+-- mob list inline froze the client for seconds). Mobs whose density is not
+-- memoized yet stay VISIBLE and are returned in the second return value, an
+-- array of { npcId, zoneName, campSize } the caller hands to
+-- AF.RequestMobDensities for time-budgeted background computation, then
+-- re-renders on its onDone (the list tightens once, when the memo is full).
+-- Returns: rows, pendingDensity|nil.
+function AF.BuildMobList(data, minSpawns, classToken, minDensityRank)
     minSpawns = tonumber(minSpawns) or 1
     if minSpawns < 0 then
         minSpawns = 0
     end
+    local wantRank = tonumber(minDensityRank) or 0
+    local peekFn = (wantRank > 0) and type(AF.PeekMobDensity) == "function"
+        and AF.PeekMobDensity or nil
+    -- The camp must hold at least the spawn threshold's worth of points, so
+    -- the two filters answer one question ("a farmable camp of >= N").
+    local campSize = math.max(minSpawns, 2)
+    local pending = nil
+
     local mobs = {}
     for _, mob in pairs(data.mobsByKey) do
         if mob.spawnedCount >= minSpawns then
-            if classToken then
+            local density, densityPass = nil, true
+            if peekFn then
+                local stillUnknown
+                density, stillUnknown = peekFn(mob.npcId, mob.zoneName, campSize)
+                if stillUnknown then
+                    pending = pending or {}
+                    pending[#pending + 1] =
+                        { npcId = mob.npcId, zoneName = mob.zoneName, campSize = campSize }
+                else
+                    local rank = density and (density.camp and density.camp.rank or density.rank)
+                    if rank and rank < wantRank then
+                        densityPass = false
+                    end
+                end
+            end
+            if densityPass and classToken then
                 local mc = mob.byClass and mob.byClass[classToken]
                 if mc and mc.affixesLeft > 0 then
                     mobs[#mobs + 1] = {
@@ -1730,9 +1780,11 @@ function AF.BuildMobList(data, minSpawns, classToken)
                         evPerKill = mc.evPerKill,
                         itemsDropped = mc.itemsDropped,
                         affixesLeft = mc.affixesLeft,
+                        density = density,
                     }
                 end
-            else
+            elseif densityPass then
+                mob.density = density  -- display-only metadata on the aggregate
                 mobs[#mobs + 1] = mob
             end
         end
@@ -1743,7 +1795,7 @@ function AF.BuildMobList(data, minSpawns, classToken)
         end
         return tostring(a.npcName or "") < tostring(b.npcName or "")
     end)
-    return mobs
+    return mobs, pending
 end
 
 -- Ranks the classes by how much affix value the account can still attune on

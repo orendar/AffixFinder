@@ -67,14 +67,27 @@ AF.killTallies = {}
 --                    limited to after a change is detected (0 = rescan on every
 --                    detected change, the original behaviour).
 --   minSpawns      : default minimum reported mob spawn count for the Mobs view.
+--   minDensity     : default minimum pack-density rank for the Mobs view
+--                    (0 = any, 1 = fair+, 2 = good+, 3 = excellent only; see
+--                    AF.GetMobDensity / AF.DENSITY_GRADE_BY_RANK in
+--                    AffixFinderWarp.lua). Needs Questie spawn data; mobs with
+--                    unknown density always pass the filter.
 --   includeMythics : whether mythic items count toward the affix calculations.
 --   automaticWarp  : T3-gated map-opening helper from the Mobs view. Enabled by
 --                    default; mob clicks still place the latest-target pin.
+--   scanBudget     : milliseconds of work per frame for the chunked scans
+--                    (discovery, zone/resist/attune scans, pack density --
+--                    they all run at this budget). Scan throughput is
+--                    budget x framerate, so this is the speed/smoothness
+--                    trade-off knob. Default 10 favours speed with mild
+--                    frame cost; drop to 3-6 for maximum smoothness.
 AF.configDefaults = {
     rescanInterval = 60,
     minSpawns = 5,
+    minDensity = 0,
     includeMythics = false,
     automaticWarp = true,
+    scanBudget = 10,
     -- tooltips : add the AffixFinder line (affixes left + best source) to item
     --            tooltips everywhere. On by default; off for players who find it
     --            intrusive. Read live by AffixFinderTooltip.lua (hooks stay
@@ -162,6 +175,7 @@ function AF.ClearAll()
     AF.attunableItemIdsLevel = nil
     AF.attuneData = {}
     AF.killTallies = {}
+    AF.mobDensity = {}  -- spawn data is static; wiped here for consistency only
     if type(_G.AffixFinderDB) == "table" then
         _G.AffixFinderDB.affixCache = nil
         _G.AffixFinderDB.attunableCache = nil

@@ -23,6 +23,7 @@ local printSourceRawDump = Debug.printSourceRawDump
 local printAffixIdProbe = Debug.printAffixIdProbe
 local printResistValue = Debug.printResistValue
 local printWarpDebug = Debug.printWarpDebug
+local printMobDebug = Debug.printMobDebug
 local printForgeDebug = Debug.printForgeDebug
 local printMemReport = Debug.printMemReport
 
@@ -79,6 +80,8 @@ local function parseOptions(msg)
             options.mode = "zonedump"
         elseif token == "warp" or token == "warpdbg" then
             options.mode = "warpdbg"
+        elseif token == "mobdbg" or token == "mob" or token == "whymob" then
+            options.mode = "mobdbg"
         elseif token == "forgedbg" or token == "forgepower" or token == "fp" then
             options.mode = "forgedbg"
         elseif token == "affixdbg" or token == "maskdbg" then
@@ -148,6 +151,11 @@ local function parseOptions(msg)
             end
         elseif token == "help" or token == "?" then
             options.help = true
+        elseif options.mode == "mobdbg" then
+            -- Mob names contain spaces: every token mobdbg doesn't recognize
+            -- accumulates into the name (matching is case-insensitive, so the
+            -- lowercasing above is harmless).
+            options.mobName = options.mobName and (options.mobName .. " " .. token) or token
         else
             options.error = token
             return options
@@ -176,6 +184,8 @@ local function printUsage()
     chat("  (items you haven't attuned, affixes ignored; a forge filter = not yet attuned at that level+)")
     chat("  /af attune instances [char|acc] [none|tf|wf|lf] [bop|boe|both] [limit] (full-clear new-item value)")
     chat("Debug: /af debug <itemId|link> [maxRows], /af zonedbg (zone classification)")
+    chat("  /af mobdbg <mob name> [char|acc] [none|tf|wf|lf] [bop|boe] [bd] [maxItems] (why a mob ranks where it does;")
+    chat("    incl. Questie spawn-pack geometry + difficulty-variant cross-check; bd dumps raw spawn coords)")
     chat("  /af zonedump [char|acc] [none|tf|wf|lf] [bop|boe|both] [sampleRows] (current-zone item gates)")
     chat("  /af warp (current-zone T3 warp-tier probe for the map-warp assist)")
     chat("  /af forgedbg (forge roll rates + prestige forge power used by EV math)")
@@ -249,6 +259,8 @@ SlashCmdList["AFFIXFINDER"] = function(msg)
         printZoneClassification(options)
     elseif options.mode == "zonedump" then
         printZoneItemDump(options)
+    elseif options.mode == "mobdbg" then
+        printMobDebug(options)
     elseif options.mode == "warpdbg" then
         printWarpDebug()
     elseif options.mode == "forgedbg" then

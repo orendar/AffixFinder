@@ -194,21 +194,555 @@ local function pickQuestieSpawn(spawns, wantedZoneName)
     }
 end
 
-local function getQuestieMobCoordinates(entry)
+local function getQuestieNpcSpawns(npcId)
     local db = importQuestieDB()
     if type(db) ~= "table" then
         return nil
     end
-
     local spawns
     if type(db.QueryNPCSingle) == "function" then
-        spawns = safeFirst(db.QueryNPCSingle, entry.npcId, "spawns")
+        spawns = safeFirst(db.QueryNPCSingle, npcId, "spawns")
     end
     if not spawns and type(db.GetNPC) == "function" then
-        local npc = safeFirst(db.GetNPC, db, entry.npcId)
+        local npc = safeFirst(db.GetNPC, db, npcId)
         spawns = npc and npc.spawns
     end
-    return pickQuestieSpawn(spawns, entry.zoneName)
+    return spawns
+end
+
+local function getQuestieMobCoordinates(entry)
+    return pickQuestieSpawn(getQuestieNpcSpawns(entry.npcId), entry.zoneName)
+end
+
+-- ALL Questie-known spawn points for an NPC, zone-matched the same way the
+-- warp pin is (exact zone-name match first, else the first zone with data, so
+-- the result is never silently empty when Questie knows the NPC under a
+-- variant naming). Coordinates are percent-of-zone-map (0-100), the only
+-- coordinate space Questie exposes; (-1,-1) "somewhere in this dungeon"
+-- placeholders are dropped. Returns nil without Questie / without data, else
+-- { points = { {x, y}, ... }, zoneId, zoneName, matchedZone } -- matchedZone
+-- false means the zone-name match failed and the fallback zone was used
+-- (callers should say so rather than present fallback data as exact).
+-- Consumed by the mobdbg pack-geometry diagnostic; same optional-enhancement
+-- status as the warp pin (no Questie dependency).
+local function questieSpawnPoints(npcId, zoneName)
+    local spawns = getQuestieNpcSpawns(npcId)
+    if type(spawns) ~= "table" then
+        return nil
+    end
+
+    local wantedKey = normLookupText(zoneName)
+    local bestZoneId, bestSpawns
+    local fallbackZoneId, fallbackSpawns
+    for zoneId, zoneSpawns in pairs(spawns) do
+        if type(zoneSpawns) == "table" and zoneSpawns[1] then
+            fallbackZoneId = fallbackZoneId or zoneId
+            fallbackSpawns = fallbackSpawns or zoneSpawns
+            if wantedKey ~= "" and isSameZoneName(zoneNameForId(zoneId), zoneName) then
+                bestZoneId, bestSpawns = zoneId, zoneSpawns
+                break
+            end
+        end
+    end
+    local zoneId = bestZoneId or fallbackZoneId
+    local zoneSpawns = bestSpawns or fallbackSpawns
+    if not zoneSpawns then
+        return nil
+    end
+
+    local points = {}
+    for _, spawn in ipairs(zoneSpawns) do
+        local x, y = tonumber(spawn[1]), tonumber(spawn[2])
+        if x and y and x >= 0 and y >= 0 then
+            points[#points + 1] = { x, y }
+        end
+    end
+    if #points == 0 then
+        return nil
+    end
+    return {
+        points = points,
+        zoneId = zoneId,
+        zoneName = zoneNameForId(zoneId),
+        matchedZone = bestZoneId ~= nil,
+    }
+end
+
+-- ---------------------------------------------------------------------------
+-- Spawn-pack density (Questie spawn points; percent-of-zone-map units)
+-- ---------------------------------------------------------------------------
+-- THE one-value density score is walkPerKill: how much of the map one kill
+-- costs in travel. It is computed twice:
+--   * pack-wide -- greedy nearest-neighbor lap through EVERY point / points.
+--   * camp (the headline when a campSize is given) -- the BEST subset of
+--     campSize points (greedy nearest-to-set growth from every seed, route =
+--     sum of join hops, MST-style). This is what a player actually farms:
+--     when 10 of a mob's 30 points sit in one room, the camp score reflects
+--     that room and ignores the scattered rest. Tie campSize to the caller's
+--     min-spawns threshold so "dense enough" and "numerous enough" answer the
+--     same question.
+-- Grades (excellent/good/fair/poor) come from walkPerKill alone. NEVER grade
+-- on nearest-neighbor gap alone: with many points everything has SOME close
+-- neighbor, so a gap-only grade calls any numerous mob "tight" -- the Gundrak
+-- Drakkari Frenzy lesson (24 points over a third of the map, 2.2% mean gap,
+-- but a 78% lap = 3.3%/kill = poor, which matches how it farms). Span,
+-- clusters, and gaps are supporting `shape` detail only.
+--
+-- spawnGeometry(points, campSize) returns nil for no points, else { points,
+-- sampled, meanGap, maxGap, spanX, spanY, spanDiag, clusters, clusterSizes
+-- (desc), largestClusterSpan, routeLen, walkPerKill, grade, shape,
+-- camp = { size, routeLen, walkPerKill, grade } | nil (campSize < 2) }.
+--
+-- CAVEATS: units are percent of the ZONE MAP, so values are comparable
+-- between mobs of the same zone but only roughly across zones (5% of
+-- Dustwallow is a much longer walk than 5% of Deadmines); thresholds are
+-- deliberately coarse for that reason. The lap is an open path (respawns
+-- refill behind you), not a closed cycle.
+local SPAWN_GAP_TIGHT = 3       -- mean gap <= this (% of map) is locally dense
+local SPAWN_GAP_MEDIUM = 7      -- mean gap <= this reads "medium"; above, "sparse"
+local SPAWN_CLUSTER_LINK = 6    -- points within this gap chain into one cluster
+local SPAWN_CAMP_SPAN = 12      -- a pack/cluster with a bounding diagonal <= this is a "camp"
+local SPAWN_GEOMETRY_CAP = 200  -- O(n^2) guard; beyond this, sample the first n
+-- walkPerKill grade boundaries (% of map walked per kill on a farming lap).
+local DENSITY_EXCELLENT = 1.0
+local DENSITY_GOOD = 1.8
+local DENSITY_FAIR = 3.0        -- above this: "poor"
+
+local DENSITY_RANK = { poor = 0, fair = 1, good = 2, excellent = 3 }
+-- Exposed so views can map a saved rank back to its label (0=any is the
+-- filter's "off" value, not a grade).
+AF.DENSITY_GRADE_BY_RANK = { [1] = "fair", [2] = "good", [3] = "excellent" }
+
+local function densityGrade(walkPerKill)
+    if walkPerKill <= DENSITY_EXCELLENT then
+        return "excellent"
+    elseif walkPerKill <= DENSITY_GOOD then
+        return "good"
+    elseif walkPerKill <= DENSITY_FAIR then
+        return "fair"
+    end
+    return "poor"
+end
+
+-- Best camp of k points: from every seed, grow the set by repeatedly adding
+-- the point nearest to ANY member (Prim-style, O(seeds x k x m) with the
+-- incremental nearest-distance array); route = sum of join hops. The minimum
+-- over seeds is the densest k-subset a farmer could camp. When Questie maps
+-- fewer points than requested, the camp covers what exists and is marked
+-- `short` -- the grade is then about a smaller camp than asked for, and
+-- displays should say so (the server's spawn count and Questie's point list
+-- routinely disagree, so this is a data note, not an error).
+local function bestCamp(points, m, k, dist, maybeYield)
+    k = math.floor(tonumber(k) or 0)
+    if k < 2 or m < 2 then
+        return nil
+    end
+    local short = k > m
+    if k > m then
+        k = m
+    end
+    local bestRoute
+    for seed = 1, m do
+        maybeYield()
+        local inSet = { [seed] = true }
+        local nearestDist = {}
+        for j = 1, m do
+            if j ~= seed then
+                nearestDist[j] = dist(seed, j)
+            end
+        end
+        local route = 0
+        for _ = 2, k do
+            local bj, bd
+            for j = 1, m do
+                local d = nearestDist[j]
+                if not inSet[j] and d and (not bd or d < bd) then
+                    bj, bd = j, d
+                end
+            end
+            route = route + bd
+            inSet[bj] = true
+            for j = 1, m do
+                if not inSet[j] then
+                    local d = dist(bj, j)
+                    if d < nearestDist[j] then
+                        nearestDist[j] = d
+                    end
+                end
+            end
+        end
+        if not bestRoute or route < bestRoute then
+            bestRoute = route
+        end
+    end
+    local walkPerKill = bestRoute / k
+    return { size = k, routeLen = bestRoute, walkPerKill = walkPerKill,
+             grade = densityGrade(walkPerKill), short = short or nil }
+end
+
+-- `maybeYield` (optional) is called at every coarse step of the O(n^2)
+-- phases (each slice between calls is O(n), microseconds at the 200-point
+-- cap). The background worker passes a function that yields its coroutine
+-- when the frame budget is spent, so even ONE big mob cannot blow a frame --
+-- the per-item budget check alone could not bound a single item's cost.
+-- Synchronous callers omit it.
+local function noYield() end
+
+local function spawnGeometry(points, campSize, maybeYield)
+    maybeYield = maybeYield or noYield
+    local n = #(points or {})
+    if n == 0 then
+        return nil
+    end
+    if n == 1 then
+        return { points = 1, sampled = 1, meanGap = 0, maxGap = 0,
+                 spanX = 0, spanY = 0, spanDiag = 0, clusters = 1,
+                 clusterSizes = { 1 }, largestClusterSpan = 0, routeLen = 0,
+                 walkPerKill = 0, grade = "single spawn", shape = "single spawn" }
+    end
+    local m = math.min(n, SPAWN_GEOMETRY_CAP)
+
+    local function dist(i, j)
+        local dx = points[i][1] - points[j][1]
+        local dy = points[i][2] - points[j][2]
+        return math.sqrt(dx * dx + dy * dy)
+    end
+
+    -- Nearest-neighbor gaps + bounding box in one pass.
+    local sum, maxGap = 0, 0
+    local minX, maxX = points[1][1], points[1][1]
+    local minY, maxY = points[1][2], points[1][2]
+    for i = 1, m do
+        maybeYield()
+        local x, y = points[i][1], points[i][2]
+        if x < minX then minX = x end
+        if x > maxX then maxX = x end
+        if y < minY then minY = y end
+        if y > maxY then maxY = y end
+        local best
+        for j = 1, m do
+            if j ~= i then
+                local d = dist(i, j)
+                if not best or d < best then
+                    best = d
+                end
+            end
+        end
+        sum = sum + best
+        if best > maxGap then
+            maxGap = best
+        end
+    end
+    local meanGap = sum / m
+    local spanX, spanY = maxX - minX, maxY - minY
+    local spanDiag = math.sqrt(spanX * spanX + spanY * spanY)
+
+    -- Single-linkage clusters: chain points within SPAWN_CLUSTER_LINK.
+    local clusterOf = {}
+    local clusterCount = 0
+    local clusterSizes = {}
+    local largestClusterSpan = 0
+    for i = 1, m do
+        maybeYield()
+        if not clusterOf[i] then
+            clusterCount = clusterCount + 1
+            local stack = { i }
+            clusterOf[i] = clusterCount
+            local members = {}
+            while #stack > 0 do
+                local cur = stack[#stack]
+                stack[#stack] = nil
+                members[#members + 1] = cur
+                for j = 1, m do
+                    if not clusterOf[j] and dist(cur, j) <= SPAWN_CLUSTER_LINK then
+                        clusterOf[j] = clusterCount
+                        stack[#stack + 1] = j
+                    end
+                end
+            end
+            clusterSizes[#clusterSizes + 1] = #members
+            local cMinX, cMaxX = points[members[1]][1], points[members[1]][1]
+            local cMinY, cMaxY = points[members[1]][2], points[members[1]][2]
+            for _, idx in ipairs(members) do
+                local x, y = points[idx][1], points[idx][2]
+                if x < cMinX then cMinX = x end
+                if x > cMaxX then cMaxX = x end
+                if y < cMinY then cMinY = y end
+                if y > cMaxY then cMaxY = y end
+            end
+            local cdx, cdy = cMaxX - cMinX, cMaxY - cMinY
+            local cSpan = math.sqrt(cdx * cdx + cdy * cdy)
+            if cSpan > largestClusterSpan then
+                largestClusterSpan = cSpan
+            end
+        end
+    end
+    table.sort(clusterSizes, function(a, b) return a > b end)
+
+    -- Greedy nearest-neighbor lap through every point.
+    local visited = { [1] = true }
+    local current = 1
+    local routeLen = 0
+    for _ = 2, m do
+        maybeYield()
+        local best, bestD
+        for j = 1, m do
+            if not visited[j] then
+                local d = dist(current, j)
+                if not bestD or d < bestD then
+                    best, bestD = j, d
+                end
+            end
+        end
+        routeLen = routeLen + bestD
+        visited[best] = true
+        current = best
+    end
+
+    local walkPerKill = routeLen / m
+
+    -- The supporting shape description.
+    local shape
+    if spanDiag <= SPAWN_CAMP_SPAN then
+        shape = "tight camp"
+    elseif clusterCount >= 2 and clusterCount <= 3
+        and largestClusterSpan <= SPAWN_CAMP_SPAN then
+        shape = clusterCount .. " separate camps"
+    elseif meanGap <= SPAWN_GAP_TIGHT then
+        shape = "locally dense but spread out"
+    elseif meanGap <= SPAWN_GAP_MEDIUM then
+        shape = "medium spread"
+    else
+        shape = "sparse"
+    end
+
+    return {
+        points = n, sampled = m,
+        meanGap = meanGap, maxGap = maxGap,
+        spanX = spanX, spanY = spanY, spanDiag = spanDiag,
+        clusters = clusterCount, clusterSizes = clusterSizes,
+        largestClusterSpan = largestClusterSpan,
+        routeLen = routeLen,
+        walkPerKill = walkPerKill,
+        grade = densityGrade(walkPerKill),
+        shape = shape,
+        camp = bestCamp(points, m, campSize, dist, maybeYield),
+    }
+end
+
+-- Memoized per-mob density, the entry point views use. campSize ties the camp
+-- metric to the caller's min-spawns threshold. Unknown density (Questie
+-- absent / no data for the NPC) means "do not hide" -- missing data is not
+-- evidence of sparseness. Results are the spawnGeometry table plus `rank` /
+-- camp `rank` (0-3 vs AF.DENSITY_GRADE_BY_RANK) and `matchedZone`. The memo
+-- (AF.mobDensity) holds shared result tables keyed by npc/zone/campSize --
+-- small scalars, in-memory only, never persisted; spawn data is static so
+-- only ClearAll drops it (consistency, not correctness). `false` in the memo
+-- = computed and known-missing (so it is never re-queued).
+--
+-- Three access paths, because computing geometry for a whole mob list in one
+-- frame freezes the client for seconds:
+--   AF.GetMobDensity     -- compute-on-miss; for one-offs (mobdbg, tooltips).
+--   AF.PeekMobDensity    -- memo lookup ONLY, never computes. Returns
+--                           (result|nil, stillUnknown): stillUnknown=true
+--                           means "not computed yet" (queue it), false means
+--                           the answer is final (incl. known-missing).
+--   AF.RequestMobDensities -- queue {npcId, zoneName, campSize} requests for
+--                           a time-budgeted OnUpdate worker (own frame, so it
+--                           never collides with the scans' chunker) and call
+--                           every onDone callback once the queue drains.
+--                           Already-memoized keys are skipped; duplicate
+--                           queue entries are deduped.
+AF.mobDensity = {}
+
+local function densityKey(npcId, zoneName, campSize)
+    return npcId .. ":" .. tostring(zoneName or "") .. ":" .. campSize
+end
+
+local function computeAndMemoDensity(npcId, zoneName, campSize, maybeYield)
+    local key = densityKey(npcId, zoneName, campSize)
+    local memo = AF.mobDensity[key]
+    if memo ~= nil then
+        return memo
+    end
+    local info = questieSpawnPoints(npcId, zoneName)
+    local geo = info and spawnGeometry(info.points, campSize, maybeYield)
+    if not geo then
+        AF.mobDensity[key] = false
+        return false
+    end
+    geo.matchedZone = info.matchedZone
+    -- A single spawn point ranks excellent for the DENSITY filter (there is no
+    -- walking); whether one mob is worth camping is the spawn threshold's call.
+    geo.rank = DENSITY_RANK[geo.grade] or 3
+    if geo.camp then
+        geo.camp.rank = DENSITY_RANK[geo.camp.grade] or 3
+    end
+    AF.mobDensity[key] = geo
+    return geo
+end
+
+function AF.GetMobDensity(npcId, zoneName, campSize)
+    npcId = tonumber(npcId)
+    if not npcId then
+        return nil
+    end
+    local result = computeAndMemoDensity(npcId, zoneName, math.floor(tonumber(campSize) or 0))
+    return result or nil
+end
+
+function AF.PeekMobDensity(npcId, zoneName, campSize)
+    npcId = tonumber(npcId)
+    if not npcId then
+        return nil, false
+    end
+    local memo = AF.mobDensity[densityKey(npcId, zoneName, math.floor(tonumber(campSize) or 0))]
+    if memo == nil then
+        return nil, true
+    end
+    return memo or nil, false
+end
+
+local densityTicker = CreateFrame("Frame")
+local densityRunning = false
+local densityQueue = {}
+local densityQueued = {}
+local densityOnDone = {}
+-- Chat progress like the scans ("Scan pack density started / at 50% /
+-- finished"), so the background work is visible to the user. Only for runs
+-- worth announcing (>= DENSITY_PROGRESS_MIN mobs) -- small top-up runs after
+-- a filter tweak stay silent. The total is re-derived every step because the
+-- queue can grow mid-run.
+local densityProgress = nil
+local densityProcessedRun = 0
+local DENSITY_PROGRESS_MIN = 20
+local densityProfileMs = (type(debugprofilestop) == "function") and debugprofilestop or nil
+-- Same per-frame budget as the scans (the "Scan speed" setting): the
+-- mid-item coroutine yielding already bounds any single computation, so
+-- density can run at full scan rate without the stutter that motivated the
+-- old half-rate clamp.
+local function densityBudgetMs()
+    return tonumber(AF.GetConfig("scanBudget")) or 10
+end
+local DENSITY_FRAME_CAP = 25    -- fallback cap when no profiling timer exists
+
+local function densityFlushCallbacks()
+    local callbacks = densityOnDone
+    densityOnDone = {}
+    for _, cb in ipairs(callbacks) do
+        pcall(cb)
+    end
+end
+
+-- The budget must bound even a SINGLE item's cost (a 200-point mob's
+-- best-camp search alone can take far longer than one frame), so each
+-- computation runs in a coroutine that yields whenever the CURRENT tick's
+-- budget is spent. `tickBudgetHit` is a shared upvalue refreshed every tick:
+-- a coroutine created in an earlier tick must consult THIS tick's deadline
+-- when resumed, never the stale one it was created under.
+local densityJob = nil   -- in-flight coroutine, resumed across ticks
+local tickBudgetHit = nil
+
+local function densityMaybeYield()
+    if tickBudgetHit and tickBudgetHit() then
+        coroutine.yield()
+    end
+end
+
+local function densityTick()
+    local startMs = densityProfileMs and densityProfileMs()
+    if startMs then
+        local budget = densityBudgetMs()
+        tickBudgetHit = function()
+            return (densityProfileMs() - startMs) >= budget
+        end
+    else
+        tickBudgetHit = nil  -- no timer (tests): items run whole, capped below
+    end
+
+    local processed = 0
+    while true do
+        if not densityJob then
+            local req = densityQueue[#densityQueue]
+            if not req then
+                break
+            end
+            densityQueue[#densityQueue] = nil
+            densityQueued[req.key] = nil
+            densityJob = coroutine.create(function()
+                computeAndMemoDensity(req.npcId, req.zoneName, req.campSize, densityMaybeYield)
+            end)
+        end
+        local ok = coroutine.resume(densityJob)
+        if not ok or coroutine.status(densityJob) == "dead" then
+            -- Finished -- or errored, in which case the memo stays unset and a
+            -- later request may retry; either way this job is over.
+            densityJob = nil
+            processed = processed + 1
+            densityProcessedRun = densityProcessedRun + 1
+            if densityProgress then
+                densityProgress(densityProcessedRun, densityProcessedRun + #densityQueue)
+            end
+        else
+            break  -- yielded mid-item: this frame's budget is spent
+        end
+        if tickBudgetHit then
+            if tickBudgetHit() then
+                break
+            end
+        elseif processed >= DENSITY_FRAME_CAP then
+            break
+        end
+    end
+    tickBudgetHit = nil
+
+    if #densityQueue == 0 and not densityJob then
+        densityRunning = false
+        densityProgress = nil  -- makeProgress already printed "finished"
+        densityTicker:SetScript("OnUpdate", nil)
+        densityFlushCallbacks()
+    end
+end
+
+function AF.RequestMobDensities(requests, onDone)
+    for _, r in ipairs(requests or {}) do
+        local npcId = tonumber(r.npcId)
+        if npcId then
+            local campSize = math.floor(tonumber(r.campSize) or 0)
+            local key = densityKey(npcId, r.zoneName, campSize)
+            if AF.mobDensity[key] == nil and not densityQueued[key] then
+                densityQueued[key] = true
+                densityQueue[#densityQueue + 1] =
+                    { key = key, npcId = npcId, zoneName = r.zoneName, campSize = campSize }
+            end
+        end
+    end
+    if onDone then
+        densityOnDone[#densityOnDone + 1] = onDone
+    end
+    local outstanding = #densityQueue
+    if outstanding == 0 then
+        -- Nothing left to compute; settle callbacks immediately.
+        densityFlushCallbacks()
+        return 0
+    end
+    if not densityRunning then
+        densityProcessedRun = 0
+        densityProgress = nil
+    end
+    -- Announce in chat once the run is big enough to be worth narrating --
+    -- including when a running quiet run grows past the threshold. Created
+    -- BEFORE the ticker starts: the first tick may already complete work.
+    if not densityProgress
+        and (densityProcessedRun + outstanding) >= DENSITY_PROGRESS_MIN
+        and type(I.Scan) == "table" and type(I.Scan.makeProgress) == "function" then
+        densityProgress = I.Scan.makeProgress("pack density")
+    end
+    if not densityRunning then
+        densityRunning = true
+        densityTicker:SetScript("OnUpdate", densityTick)
+    end
+    return outstanding
 end
 
 function AF.ResolveMobWarpTarget(entry)
@@ -601,4 +1135,6 @@ I.Warp = {
     bundledWarpIndex = bundledWarpIndex,
     isSameZoneName = isSameZoneName,
     qtRunnerWarpIndex = qtRunnerWarpIndex,
+    questieSpawnPoints = questieSpawnPoints,
+    spawnGeometry = spawnGeometry,
 }

@@ -56,7 +56,7 @@ The **Find** control at the top picks what every tab counts:
 The tabs are views over whichever model is selected:
 
 - **Zones** - zone rankings by remaining affix value
-- **Mobs** - individual mob rankings, with zone and spawn filters
+- **Mobs** - individual mob rankings, with zone, spawn, and pack-density filters (the **Density** button cycles any / fair+ / good+ / excellent: how tightly the mob's best camp of Min-spawns spawn points is packed, from Questie's spawn data; mobs with unknown density always show, and each row's tooltip includes its density). Density geometry is computed in the background the first time the filter is used - chat announces it like a scan ("Scan pack density started/finished"), the caption shows progress, and the list tightens when it finishes, with no freeze.
 - **Items** - the actual affixed items still worth farming, with the specific suffixes you still need and the best mob to farm each from
 - **Instances** - full dungeon/raid clears ranked by expected affixes per clear and per 1000 kills, for when you would rather just run a dungeon than camp one mob
 - **Current Zone** - what is still useful where you are standing
@@ -80,6 +80,8 @@ Useful settings include:
 - configure T3 map-warp assist from mob/resist rows
 - choose the auto-rescan interval
 - set the default minimum mob spawn count
+- set the default minimum pack density for the Mobs view (any / fair+ / good+ / excellent; needs Questie)
+- set the **scan speed**: how many milliseconds of each frame the background scans (including pack density) may use. Default 10 favours speed with a mild frame-rate cost while scans run; drop to 3-6 for maximum smoothness.
 
 AffixFinder does not save the full item graph or ranking results. It only persists small settings, window position, minimap-button position, and lightweight item-id caches (the affixed-item and attunable-item lists).
 
@@ -95,6 +97,9 @@ AffixFinder does not save the full item graph or ranking results. It only persis
 - The Instances tab models a **full clear**: each mob's expected drops times its spawn count, summed over the instance. "Kills per clear" counts every mob that drops *any* affixed item (needed or not), so the per-1000-kills density divides by something close to a real clear; mobs that drop no affixed items at all are still not counted. Difficulty and raid-size variants (Heroic, 10/25) fold into one row under the generic instance name, because the server splits their source data incompletely across the variant names; Mythic dungeons keep their own row (their drop pool is separate). Mobs with no recorded spawns (summons, scripted spawns) are not counted, and only mobs **inside** the instance count - the open-world area around an entrance that shares the instance's name (like the Deadmines cove in Westfall) is excluded. The Dungeon and Raid source filters work normally there; World never applies. Sort raids by **Affixes/clear** - lockouts make density the wrong measure for them.
 - Resistance values are estimates based on item level, because the exact rolled suffix value is not available during scans.
 - Diagnostic commands such as `/af debug`, `/af zonedbg`, `/af warp`, and `/af forgedbg` are available if you want to inspect what the addon is reading.
+- `/af mobdbg <mob name>` explains why a specific mob ranks where it does: it breaks the mob's expected value down item by item (drop chance x affixes still needed), shows roughly how many kills one useful affix takes, and calls out anything suspicious - one item carrying most of the value, several loot entries merged at the highest chance (difficulty variants), unusually generous drop chances, or cached results that no longer match your attunement progress. Scope/forge/bind tokens work as usual, e.g. `/af mobdbg drakkari frenzy acc tf`.
+- With **Questie** loaded, `/af mobdbg` also reports the mob's **pack density** as one number: **walk per kill** - how much of the map (in percent) one kill costs in travel, graded **excellent** (under ~1%, e.g. 15 spawns stacked in one room), **good**, **fair**, or **poor** (over ~3%, e.g. two dozen spawns split into loose far-apart groups). The headline score is the mob's **best camp**: the densest pocket of (at least) your Min-spawns setting's worth of spawn points, because that pocket is what you would actually farm - 10 tightly clustered points are not penalized by 14 more scattered across the zone. The whole-pack score and a shape line (cluster count and sizes, map coverage, neighbor gaps) follow for context. Compare within a zone rather than across zones (map percent means different distances in different zones). Add `bd` to dump the raw spawn coordinates if you want to sanity-check Questie's data. Without Questie the line just reads unavailable - nothing else changes.
+- `/af mobdbg` also lists **difficulty variants** of the same NPC (e.g. its Gundrak and Gundrak Heroic rows): per-mob and per-zone numbers never mix difficulties, and the line warns if the same item is listed under both names, which would inflate that instance's folded row in the Instances view.
 
 ## Acknowledgements
 

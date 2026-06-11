@@ -39,6 +39,8 @@ local REQUIRED_WARP_TIER = Warp.REQUIRED_WARP_TIER
 local bundledWarpIndex = Warp.bundledWarpIndex
 local isSameZoneName = Warp.isSameZoneName
 local qtRunnerWarpIndex = Warp.qtRunnerWarpIndex
+local questieSpawnPoints = Warp.questieSpawnPoints
+local spawnGeometry = Warp.spawnGeometry
 local normZoneKey = ZoneClassify.normZoneKey
 
 -- Diagnostic: shows how the zones in the current data classify (category /
@@ -338,6 +340,402 @@ local function printZoneItemDump(options)
                 end
             end
         end, progress)
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Per-mob ranking diagnosis (/af mobdbg <mob name>)
+-- ---------------------------------------------------------------------------
+-- Explains WHY a mob scores the EV it does, for the two failure modes that
+-- look identical from the rankings: a counterintuitive-but-correct rank
+-- ("looks great on paper, feels bad in practice") and genuinely inflated
+-- loot data. It re-derives every per-item contribution live (drop chance x
+-- valuePerDrop x forge rarity), then flags the usual suspects: one item
+-- dominating the EV, several source rows merged at MAX chance (difficulty
+-- variants of the same NPC), implausibly high reported drop chances, and a
+-- cached slice that no longer matches a live recompute.
+
+local function trim(text)
+    text = tostring(text or "")
+    text = string.gsub(text, "^%s+", "")
+    text = string.gsub(text, "%s+$", "")
+    return text
+end
+
+local function pctText(p)
+    return string.format("%.2f%%", (p or 0) * 100)
+end
+
+-- Walks one item's raw source rows and reduces them to this mob's merged view.
+-- Returns nil when the item has no counted killable row for the mob, else
+-- { rawRows, minChance, maxChance } -- maxChance is what the scan uses
+-- (getCreatureSources keeps the max across rows for the same zone:npc), so
+-- rawRows > 1 with minChance < maxChance is the variant-merge inflation signal.
+local function mobSourceStats(itemId, npcId, zoneName)
+    if type(ItemLocGetSourceCount) ~= "function" or type(ItemLocGetSourceAt) ~= "function" then
+        return nil
+    end
+    local stats
+    local count = safeFirst(ItemLocGetSourceCount, itemId) or 0
+    for i = 1, count do
+        local ok, srcType, srcObjType, srcObjId, chance, dropsPerThousand, objName, srcZone =
+            safeCall(ItemLocGetSourceAt, itemId, i)
+        if ok and tonumber(srcObjId) == npcId and trim(srcZone) == zoneName
+            and isCreatureSource(srcType, srcObjType, objName) then
+            local p = getDropProbability(chance, dropsPerThousand)
+            if p > 0 then
+                if not stats then
+                    stats = { rawRows = 0, minChance = p, maxChance = p }
+                end
+                stats.rawRows = stats.rawRows + 1
+                if p < stats.minChance then stats.minChance = p end
+                if p > stats.maxChance then stats.maxChance = p end
+            end
+        end
+    end
+    return stats
+end
+
+-- Spawn-pack geometry over Questie spawn points (percent-of-zone-map units).
+--
+-- (Spawn-pack geometry lives in AffixFinderWarp.lua next to its Questie data
+-- source: spawnGeometry / AF.GetMobDensity. mobdbg only renders it.)
+
+-- Recomputes one mob aggregate from live data, per item. Pure computation
+-- (exported for the test); the printer below formats it. Every entry:
+-- { itemId, category, possible, affixesLeft, unattuned, chance, ev, rawRows,
+--   minChance, maxChance, gone } sorted by ev, best-first. `gone` marks items
+-- the live gate no longer passes (the cached slice predates an attune).
+local function buildMobDiagnosis(data, mob)
+    local forgeDropChance = data.forgeDropChance or 1
+    local includeMythics = data.includeMythics and true or false
+    local items = {}
+    local recomputedEv = 0
+    for _, itemId in ipairs(mob.items or {}) do
+        local value = affixedItemValue(itemId, data.scope, data.forgeFilter,
+            data.bindFilter, includeMythics, false)
+        local stats = mobSourceStats(itemId, mob.npcId, mob.zoneName)
+        local chance = stats and stats.maxChance or 0
+        local ev = chance * forgeDropChance * (value and value.valuePerDrop or 0)
+        recomputedEv = recomputedEv + ev
+        items[#items + 1] = {
+            itemId = itemId,
+            category = value and value.category or nil,
+            possible = value and value.possible or 0,
+            affixesLeft = value and value.affixesLeft or 0,
+            unattuned = value and value.unattuned or false,
+            chance = chance,
+            ev = ev,
+            rawRows = stats and stats.rawRows or 0,
+            minChance = stats and stats.minChance or 0,
+            maxChance = chance,
+            gone = (value == nil) or (stats == nil),
+        }
+    end
+    table.sort(items, function(a, b)
+        if a.ev ~= b.ev then
+            return a.ev > b.ev
+        end
+        return (a.itemId or 0) < (b.itemId or 0)
+    end)
+
+    local diag = {
+        items = items,
+        recomputedEv = recomputedEv,
+        cachedEv = mob.evPerKill or 0,
+        topShare = 0,
+        mergedRowItems = 0,
+        highChanceItems = 0,
+        goneItems = 0,
+    }
+    if recomputedEv > 0 and items[1] then
+        diag.topShare = items[1].ev / recomputedEv
+    end
+    for _, it in ipairs(items) do
+        if it.rawRows > 1 and (it.maxChance - it.minChance) > 0.000001 then
+            diag.mergedRowItems = diag.mergedRowItems + 1
+        end
+        if it.chance >= 0.10 then
+            diag.highChanceItems = diag.highChanceItems + 1
+        end
+        if it.gone then
+            diag.goneItems = diag.goneItems + 1
+        end
+    end
+    local base = math.max(diag.cachedEv, 0.000001)
+    diag.stale = diag.goneItems > 0
+        or (math.abs(diag.recomputedEv - diag.cachedEv) / base) > 0.02
+
+    -- Difficulty-variant cross-check: the same npcId aggregated under another
+    -- zone name that folds to the same instance ("Gundrak" vs "Gundrak
+    -- Heroic"). The per-mob rows themselves never mix difficulties (the
+    -- aggregation keys on the exact zone name), but the Instances view FOLDS
+    -- variants into one row by summing their EV shares -- which is only honest
+    -- while the server lists each item under one variant name. sharedItems
+    -- counts the items this mob and the variant BOTH drop (among items with
+    -- affixes left): every shared item is double-counted by that fold.
+    diag.variants = {}
+    local ownKey = normZoneKey(mob.zoneName)
+    local ownItems = {}
+    for _, itemId in ipairs(mob.items or {}) do
+        ownItems[itemId] = true
+    end
+    for _, other in pairs(data.mobsByKey) do
+        if other ~= mob and other.npcId == mob.npcId
+            and normZoneKey(other.zoneName) == ownKey then
+            local shared = 0
+            for _, itemId in ipairs(other.items or {}) do
+                if ownItems[itemId] then
+                    shared = shared + 1
+                end
+            end
+            diag.variants[#diag.variants + 1] = {
+                zoneName = other.zoneName,
+                spawnedCount = other.spawnedCount,
+                evPerKill = other.evPerKill or 0,
+                itemsDropped = other.itemsDropped or 0,
+                sharedItems = shared,
+            }
+        end
+    end
+    table.sort(diag.variants, function(a, b)
+        return tostring(a.zoneName or "") < tostring(b.zoneName or "")
+    end)
+    return diag
+end
+
+local function printPackGeometry(mob, showSpawns, campSize)
+    local spawnInfo = questieSpawnPoints and questieSpawnPoints(mob.npcId, mob.zoneName)
+    if not spawnInfo then
+        chat("  Pack density: unavailable (Questie not loaded, or no spawn data for this NPC).")
+        return
+    end
+    local geo = spawnGeometry(spawnInfo.points, campSize)
+    if not geo then
+        chat("  Pack density: Questie has no usable coordinates for this NPC.")
+        return
+    end
+
+    local zoneNote = ""
+    if not spawnInfo.matchedZone then
+        zoneNote = string.format(" [zone match FAILED; fallback data from '%s' (id %s) -- treat as approximate]",
+            tostring(spawnInfo.zoneName or "?"), tostring(spawnInfo.zoneId))
+    end
+    if geo.points == 1 then
+        chat("  Pack density (Questie): 1 spawn point -- a fixed camp; density is moot (respawn-bound)." .. zoneNote)
+    else
+        local sampleNote = (geo.sampled < geo.points)
+            and (" (geometry sampled over " .. geo.sampled .. ")") or ""
+        -- The headline is the BEST CAMP (the densest min-spawns-sized pocket
+        -- -- what a player actually farms); the whole pack is context.
+        if geo.camp then
+            local shortNote = geo.camp.short
+                and " (fewer points mapped than the min-spawns camp asked for)" or ""
+            chat(string.format("  Pack density (Questie): %s -- best camp of %d%s: ~%.1f%% of the map walked per kill. Whole pack: %s (~%.1f%%/kill, %d points%s, lap ~%.0f%%).",
+                geo.camp.grade, geo.camp.size, shortNote, geo.camp.walkPerKill,
+                geo.grade, geo.walkPerKill, geo.points, sampleNote, geo.routeLen) .. zoneNote)
+        else
+            chat(string.format("  Pack density (Questie): %s -- ~%.1f%% of the map walked per kill (%d spawn points%s, full lap ~%.0f%%).",
+                geo.grade, geo.walkPerKill, geo.points, sampleNote, geo.routeLen) .. zoneNote)
+        end
+        local clusterText = tostring(geo.clusters)
+        if geo.clusters > 1 and geo.clusters <= 5 and geo.clusterSizes then
+            clusterText = clusterText .. " (" .. table.concat(geo.clusterSizes, "+") .. " points)"
+        end
+        chat(string.format("    shape: %s; clusters %s covering %.0f%% x %.0f%%; gap between neighbors %.1f%% avg / %.1f%% max. Units are %% of the zone map, so compare within a zone.",
+            geo.shape, clusterText, geo.spanX, geo.spanY, geo.meanGap, geo.maxGap))
+    end
+
+    -- Mapped points vs the server's reported spawn count: a big mismatch means
+    -- shared/rare spawn points (the fractional counts) or stale Questie data.
+    local serverSpawns = tonumber(mob.spawnedCount) or 0
+    if serverSpawns > 0 and (geo.points >= serverSpawns * 2 or serverSpawns >= geo.points * 2) then
+        chat(string.format("    Note: server reports %s spawns vs %d mapped points -- shared/rare spawn points or incomplete Questie data.",
+            tostring(mob.spawnedCount), geo.points))
+    end
+
+    -- Raw dump (the `bd` flag) for validating Questie's data quality in-game:
+    -- walk a few of these on foot and see if mobs are actually there.
+    if showSpawns then
+        local maxPoints = math.min(#spawnInfo.points, 60)
+        chat(string.format("    Raw spawn points (x,y as %% of '%s' map; %d of %d):",
+            tostring(spawnInfo.zoneName or mob.zoneName), maxPoints, #spawnInfo.points))
+        local line = {}
+        for i = 1, maxPoints do
+            local p = spawnInfo.points[i]
+            line[#line + 1] = string.format("%.1f,%.1f", p[1], p[2])
+            if #line == 8 or i == maxPoints then
+                chat("      " .. table.concat(line, "  "))
+                line = {}
+            end
+        end
+    end
+end
+
+local function printMobDiagnosis(data, mob, limit, showSpawns, campSize)
+    local diag = buildMobDiagnosis(data, mob)
+    local evPer1000 = (mob.evPerKill or 0) * 1000
+    chat(string.format("%s (npc %d) @ %s -- %s spawns, EV %.2f/1000 kills, %d items, %d affixes left",
+        tostring(mob.npcName), mob.npcId or 0, tostring(mob.zoneName),
+        tostring(mob.spawnedCount), evPer1000, mob.itemsDropped or 0, mob.affixesLeft or 0))
+    if (mob.evPerKill or 0) > 0 then
+        chat(string.format("  Reality check: ~1 useful affix per %.0f kills. 'Affixes left' (%d) ignores drop chance; EV is the farm rate.",
+            1 / mob.evPerKill, mob.affixesLeft or 0))
+    end
+    printPackGeometry(mob, showSpawns, campSize)
+    local forgeNote = ""
+    if (data.forgeDropChance or 1) < 1 then
+        forgeNote = string.format(" x %s forge rarity", pctText(data.forgeDropChance))
+    end
+    chat("  EV/kill = drop chance x (left/possible)" .. forgeNote .. ". Top contributors:")
+
+    local shown = math.min(limit, #diag.items)
+    for i = 1, shown do
+        local it = diag.items[i]
+        local name = AF.ItemName(it.itemId) or ("item " .. tostring(it.itemId))
+        local share = (diag.recomputedEv > 0) and (it.ev / diag.recomputedEv * 100) or 0
+        local flags = ""
+        if it.gone then
+            flags = flags .. " | NO LONGER COUNTS (stale cache)"
+        elseif it.rawRows > 1 and (it.maxChance - it.minChance) > 0.000001 then
+            flags = flags .. string.format(" | merged %d rows, chance %s..%s (max wins)",
+                it.rawRows, pctText(it.minChance), pctText(it.maxChance))
+        end
+        chat(string.format("  %d. %.0f%% of EV | drop %s | left %d/%d | %s %s [%s]%s",
+            i, share, pctText(it.chance), it.affixesLeft, it.possible,
+            tostring(it.itemId), tostring(name), tostring(it.category or "?"), flags))
+    end
+    if #diag.items > shown then
+        chat("  ... +" .. (#diag.items - shown) .. " more item(s); raise the limit, e.g. /af mobdbg <name> " .. #diag.items)
+    end
+
+    -- Verdicts: the human-readable "why" lines.
+    local verdicts = {}
+    local top = diag.items[1]
+    if top and not top.gone and diag.topShare >= 0.5 then
+        verdicts[#verdicts + 1] = string.format(
+            "%.0f%% of the EV hangs on ONE item (%s at %s). If that chance is not real in-game, the rank is wrong -- /af debug %d shows its raw rows.",
+            diag.topShare * 100, AF.ItemName(top.itemId) or top.itemId,
+            pctText(top.chance), top.itemId)
+    elseif #diag.items >= 8 and diag.topShare > 0 and diag.topShare <= 0.15 then
+        verdicts[#verdicts + 1] =
+            "Value is spread thin across many small chances: honest in aggregate, but individual kills will rarely feel rewarding."
+    end
+    if diag.mergedRowItems > 0 then
+        verdicts[#verdicts + 1] = diag.mergedRowItems
+            .. " item(s) merge several source rows with DIFFERENT chances for this mob; the scan keeps the max. If the high row belongs to another difficulty/variant, the EV is inflated."
+    end
+    if diag.highChanceItems > 0 then
+        verdicts[#verdicts + 1] = diag.highChanceItems
+            .. " item(s) report a >= 10% drop chance -- plausible for a boss, suspicious for trash. If kills don't bear it out, the loot data is inflated."
+    end
+    if diag.stale then
+        verdicts[#verdicts + 1] = string.format(
+            "Cached EV (%.2f/1000) no longer matches a live recompute (%.2f/1000): the slice predates recent attunes. Rescan (/af clearcache or the UI's Rescan).",
+            diag.cachedEv * 1000, diag.recomputedEv * 1000)
+    end
+    if #verdicts == 0 then
+        verdicts[1] = "No red flags: chances are modest, value is distributed, and the cache matches a live recompute. The rank reflects the loot data."
+    end
+    for _, v in ipairs(verdicts) do
+        chat("  ! " .. v)
+    end
+
+    -- Difficulty variants of the same NPC (same instance, other variant name).
+    for _, variant in ipairs(diag.variants) do
+        chat(string.format("  Variant: same NPC @ %s -- %s spawns, EV %.2f/1000, %d items (%d shared with this row)",
+            tostring(variant.zoneName), tostring(variant.spawnedCount),
+            (variant.evPerKill or 0) * 1000, variant.itemsDropped or 0, variant.sharedItems or 0))
+        if (variant.sharedItems or 0) > 0 then
+            chat("    ! " .. variant.sharedItems
+                .. " item(s) are listed under BOTH difficulty names: the Instances view's folded row counts each once per variant, inflating that instance. (Per-mob and per-zone numbers are unaffected.)")
+        end
+    end
+end
+
+local function printMobDebug(options)
+    local needle = string.lower(trim(options.mobName))
+    if needle == "" then
+        chat("Usage: /af mobdbg <mob name> [char|acc] [none|tf|wf|lf] [bop|boe] [bd] [maxItems]")
+        chat("  e.g. /af mobdbg Drakkari Frenzy, /af mobdbg drakkari frenzy acc tf 15")
+        chat("  bd also dumps the raw Questie spawn coordinates (data-quality check).")
+        return
+    end
+    local scope = options.scope or AF.defaultScope or "character"
+    AF.ComputeZoneData(scope, options.forgeFilter, options.bindFilter, function(data, err)
+        if not data then
+            reportScanError(err, "analyze mob")
+            return
+        end
+
+        local exact, partial = {}, {}
+        for _, mob in pairs(data.mobsByKey) do
+            local nm = string.lower(mob.npcName or "")
+            if nm == needle then
+                exact[#exact + 1] = mob
+            elseif string.find(nm, needle, 1, true) then
+                partial[#partial + 1] = mob
+            end
+        end
+        local matches = (#exact > 0) and exact or partial
+        if #matches == 0 then
+            chat("No mob matching '" .. needle .. "' has remaining affix value under ("
+                .. filterCaption(scope, options.forgeFilter, options.bindFilter)
+                .. "). Check the spelling -- or its items are fully attuned / filtered out here.")
+            return
+        end
+        table.sort(matches, function(a, b)
+            if (a.evPerKill or 0) ~= (b.evPerKill or 0) then
+                return (a.evPerKill or 0) > (b.evPerKill or 0)
+            end
+            return tostring(a.zoneName or "") < tostring(b.zoneName or "")
+        end)
+
+        -- A substring matching several DIFFERENT mobs lists them instead of
+        -- analyzing; the same name across zones (difficulty variants) is
+        -- analyzed per zone below.
+        if #exact == 0 then
+            local seen, distinct = {}, 0
+            for _, mob in ipairs(matches) do
+                local nm = string.lower(mob.npcName or "")
+                if not seen[nm] then
+                    seen[nm] = true
+                    distinct = distinct + 1
+                end
+            end
+            if distinct > 1 then
+                chat("'" .. needle .. "' matches " .. distinct .. " different mobs; be more specific:")
+                local listed = math.min(#matches, 10)
+                for i = 1, listed do
+                    local mob = matches[i]
+                    chat(string.format("  %s @ %s (EV %.2f/1000)",
+                        tostring(mob.npcName), tostring(mob.zoneName), (mob.evPerKill or 0) * 1000))
+                end
+                if #matches > listed then
+                    chat("  ... +" .. (#matches - listed) .. " more")
+                end
+                return
+            end
+        end
+
+        local limit = tonumber(options.limit) or AF.defaultZoneLimit or 10
+        if limit < 1 then limit = 10 end
+        if limit > 25 then limit = 25 end
+
+        chat("Mob diagnosis (" .. filterCaption(scope, options.forgeFilter, options.bindFilter)
+            .. ", mythics " .. (data.includeMythics and "on" or "off") .. "):")
+        -- Camp size for the density headline: the configured min-spawns
+        -- threshold, so "dense enough" and "numerous enough" agree.
+        local campSize = math.max(tonumber(options.minSpawns) or 0, 2)
+        local fullSections = math.min(#matches, 3)
+        for i = 1, fullSections do
+            printMobDiagnosis(data, matches[i], limit, options.breakdown, campSize)
+        end
+        for i = fullSections + 1, #matches do
+            local mob = matches[i]
+            chat(string.format("(also matches) %s @ %s -- EV %.2f/1000",
+                tostring(mob.npcName), tostring(mob.zoneName), (mob.evPerKill or 0) * 1000))
+        end
     end)
 end
 
@@ -926,6 +1324,9 @@ end
 
 
 I.Debug = {
+    buildMobDiagnosis = buildMobDiagnosis,  -- exported for the regression test
+    spawnGeometry = spawnGeometry,          -- exported for the regression test
+    printMobDebug = printMobDebug,
     printAffixDebug = printAffixDebug,
     printAffixIdProbe = printAffixIdProbe,
     printForgeDebug = printForgeDebug,
