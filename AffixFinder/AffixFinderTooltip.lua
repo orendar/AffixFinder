@@ -3,14 +3,18 @@
 -- Adds an AffixFinder line to item tooltips anywhere in the game (bags, bank,
 -- auction house, loot, quest rewards, chat links, LootDB): how many affixes are still
 -- left to attune on the item, and -- when any remain -- the best killable source
--- and the suffixes still needed. This is what makes the addon ambient: you no
--- longer have to open the window to know whether an item in front of you is
--- worth attuning and where it drops.
+-- and the suffixes still needed. Items with no affix line of their own (non-
+-- affixed attunables, melee weapons) get the whole-item view instead: attuned,
+-- or "not attuned yet" plus the best source -- the items the New-items mode
+-- hunts. This is what makes the addon ambient: you no longer have to open the
+-- window to know whether an item in front of you is worth attuning and where
+-- it drops.
 --
--- Everything is computed ON DEMAND via AF.GetItemAffixInfo / GetRemainingAffixNames
--- (the same gates the scan uses, but for one item), so the tooltip stores no
--- state and respects the addon's memory model. A 1-entry memo absorbs the
--- multiple OnTooltipSetItem fires a single hover produces.
+-- Everything is computed ON DEMAND via AF.GetItemAffixInfo /
+-- GetRemainingAffixNames / GetItemAttuneStatus (the same gates the scans use,
+-- but for one item), so the tooltip stores no state and respects the addon's
+-- memory model. A 1-entry memo absorbs the multiple OnTooltipSetItem fires a
+-- single hover produces.
 -- ---------------------------------------------------------------------------
 
 local AF = _G.AffixFinder
@@ -38,19 +42,34 @@ end
 
 -- 1-entry memo: OnTooltipSetItem can fire several times for one hover, and a
 -- bag full of items is hovered in quick succession, so cache the last lookup.
-local lastId, lastInfo
+-- The whole-item status is only looked up (and memoized) when the affix info
+-- is nil -- it covers exactly what the affix line can't.
+local lastId, lastInfo, lastStatus
 function AF.InvalidateTooltipMemo()
     lastId = nil
     lastInfo = nil
+    lastStatus = nil
 end
 
-local function affixInfoFor(itemId)
+local function lookupItem(itemId)
     if itemId == lastId then
-        return lastInfo
+        return lastInfo, lastStatus
     end
     lastId = itemId
     lastInfo = AF.GetItemAffixInfo and AF.GetItemAffixInfo(itemId) or nil
-    return lastInfo
+    lastStatus = nil
+    if not lastInfo and AF.GetItemAttuneStatus then
+        lastStatus = AF.GetItemAttuneStatus(itemId)
+    end
+    return lastInfo, lastStatus
+end
+
+local function addBestSourceLine(tooltip, s)
+    -- The best place to farm it -- the one thing the player can't read off the
+    -- item itself. bestSource already respects the spawn threshold.
+    tooltip:AddLine(string.format("  Best source: %s -- %s (%d spawns)",
+        tostring(s.zoneName or "?"), tostring(s.npcName or "?"),
+        tonumber(s.spawnedCount) or 0), 0.8, 0.8, 0.8)
 end
 
 local function addAffixLines(tooltip, link)
@@ -66,25 +85,32 @@ local function addAffixLines(tooltip, link)
     if not itemId then
         return
     end
-    local info = affixInfoFor(itemId)
-    if not info then
-        return  -- not an affixed item, or the custom APIs are not ready yet
-    end
+    local info, status = lookupItem(itemId)
 
-    local left = info.left or 0
-    local possible = info.possible or 0
-    local valueColor = (left > 0) and LEFT_COLOR or DONE_COLOR
-    tooltip:AddLine(string.format("%sAffixFinder|r: %s%d|r/%d affixes left to attune",
-        PREFIX_COLOR, valueColor, left, possible))
-
-    -- The player is already inspecting the item, so the suffixes it can roll are
-    -- on the tooltip in front of them -- we only add what they can't see: the
-    -- best place to farm it. bestSource already respects the spawn threshold.
-    if left > 0 and info.bestSource then
-        local s = info.bestSource
-        tooltip:AddLine(string.format("  Best source: %s -- %s (%d spawns)",
-            tostring(s.zoneName or "?"), tostring(s.npcName or "?"),
-            tonumber(s.spawnedCount) or 0), 0.8, 0.8, 0.8)
+    if info then
+        local left = info.left or 0
+        local possible = info.possible or 0
+        local valueColor = (left > 0) and LEFT_COLOR or DONE_COLOR
+        tooltip:AddLine(string.format("%sAffixFinder|r: %s%d|r/%d affixes left to attune",
+            PREFIX_COLOR, valueColor, left, possible))
+        if left > 0 and info.bestSource then
+            addBestSourceLine(tooltip, info.bestSource)
+        end
+    elseif status then
+        -- No affix line of its own (non-affixed attunable, or a melee weapon
+        -- whose affixes never count): the whole-item state is the story.
+        if status.unattuned then
+            tooltip:AddLine(string.format("%sAffixFinder|r: %snot attuned yet|r",
+                PREFIX_COLOR, LEFT_COLOR))
+            if status.bestSource then
+                addBestSourceLine(tooltip, status.bestSource)
+            end
+        else
+            tooltip:AddLine(string.format("%sAffixFinder|r: %sattuned|r",
+                PREFIX_COLOR, DONE_COLOR))
+        end
+    else
+        return  -- not attunable at all, or the custom APIs are not ready yet
     end
 
     tooltip:Show()  -- re-fit the tooltip after adding the AffixFinder lines

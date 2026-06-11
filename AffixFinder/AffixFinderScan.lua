@@ -864,6 +864,24 @@ end
 -- they store no state and respect the memory model: hovering an item or building
 -- the Items list never persists anything.
 
+-- Densest killable source (max drop chance, then spawn count) among `sources`
+-- entries meeting the spawn threshold (minSpawns, default = the configured
+-- minimum), or nil. Shared by the per-item tooltip primitives so a 1-spawn mob
+-- is not offered as a farming target when the player's minimum is higher.
+local function bestCreatureSource(sources, minSpawns)
+    minSpawns = tonumber(minSpawns) or tonumber(AF.GetConfig("minSpawns")) or 0
+    local best
+    for _, s in ipairs(sources) do
+        if (s.spawnedCount or 0) >= minSpawns then
+            if not best or s.dropProbability > best.dropProbability
+                or (s.dropProbability == best.dropProbability and s.spawnedCount > best.spawnedCount) then
+                best = s
+            end
+        end
+    end
+    return best
+end
+
 -- Synastria/standard display name for an item id (custom API first), or nil.
 function AF.ItemName(itemId)
     local name = safeFirst(GetItemInfoCustom, itemId)
@@ -940,17 +958,8 @@ function AF.GetItemAffixInfo(itemId, minSpawns)
     if possible <= 0 then
         return nil
     end
-    minSpawns = tonumber(minSpawns) or tonumber(AF.GetConfig("minSpawns")) or 0
     local sources = getCreatureSources(itemId)
-    local best
-    for _, s in ipairs(sources) do
-        if (s.spawnedCount or 0) >= minSpawns then
-            if not best or s.dropProbability > best.dropProbability
-                or (s.dropProbability == best.dropProbability and s.spawnedCount > best.spawnedCount) then
-                best = s
-            end
-        end
-    end
+    local best = bestCreatureSource(sources, minSpawns)
     return {
         itemId = itemId,
         possible = possible,
@@ -1124,6 +1133,109 @@ local function persistAffixIds(ids)
     db.affixCache = { max = MAX_ITEMID, ids = ids }
 end
 
+-- Current character level, for the attunable-cache fingerprint below. 0 when
+-- the API is unavailable; the cache checks treat 0 as "unknown, do not reuse"
+-- (rediscovering is the safe direction when the level can't be read).
+local function playerLevel()
+    if type(UnitLevel) ~= "function" then
+        return 0
+    end
+    return tonumber(safeFirst(UnitLevel, "player")) or 0
+end
+
+-- The attunable-id list -- the new-attunables candidate superset consumed by
+-- AffixFinderAttune.lua -- persists in AffixFinderDB.attunableCache
+-- ({ max, level, ids }) like the affixed list, but with a LEVEL stamp on top
+-- of the MAX_ITEMID fingerprint: attunability only ever grows as characters
+-- level, so the list discovered at level L is reusable by any character at
+-- level <= L and must be rediscovered once a character exceeds it. At the
+-- level cap it is effectively static, like the affix cache. A persisted list
+-- can never produce false positives -- the per-item gate re-checks live
+-- attunability (itemMatchesScope) every scan -- so the stamp only guards
+-- against MISSING items that unlocked since discovery. The SESSION memo
+-- (AF.attunableItemIds) carries the same stamp in AF.attunableItemIdsLevel,
+-- checked on every scan, so a mid-session level-up invalidates it lazily with
+-- no event plumbing. (Unlocks driven by something other than the scanning
+-- character's level -- a new class created, an alt leveling offline -- are
+-- not fingerprintable from here; manual Rescan/ClearAll covers those.)
+-- Returns ids, stampLevel (the discovery level, which seeds the memo stamp).
+local function loadPersistedAttunableIds()
+    local db = _G.AffixFinderDB
+    local cache = type(db) == "table" and db.attunableCache
+    local level = playerLevel()
+    if type(cache) == "table" and cache.max == MAX_ITEMID
+        and type(cache.ids) == "table"
+        and level > 0 and (tonumber(cache.level) or 0) >= level then
+        return cache.ids, tonumber(cache.level) or 0
+    end
+    return nil
+end
+
+-- `level` is the level the discovery STARTED at: ids behind the chunk cursor
+-- were tested at that level, so a mid-scan ding must not inflate the stamp
+-- (the completion-time level could claim coverage the scan never had).
+local function persistAttunableIds(ids, level)
+    local db = _G.AffixFinderDB
+    if type(db) ~= "table" then
+        db = {}
+        _G.AffixFinderDB = db
+    end
+    -- Same reference (static, never mutated), so there is no copy cost.
+    db.attunableCache = { max = MAX_ITEMID, level = level, ids = ids }
+end
+
+-- The usable attunable-id list (memo while its level stamp holds, else the
+-- persisted list, loaded into the memo), or nil when a discovery pass is
+-- needed. Checking the memo stamp here -- on every scan, rather than on a
+-- level-up event -- also covers the races (e.g. a ding landing while a
+-- discovery scan is running).
+local function currentAttunableIds()
+    if AF.attunableItemIds
+        and (AF.attunableItemIdsLevel or 0) >= playerLevel() then
+        return AF.attunableItemIds
+    end
+    local persisted, persistedLevel = loadPersistedAttunableIds()
+    if persisted then
+        AF.attunableItemIds = persisted
+        AF.attunableItemIdsLevel = persistedLevel
+        return persisted
+    end
+    return nil
+end
+
+-- One chunked pass over the whole id space, filling whichever id lists are
+-- requested. Both ensure* functions funnel here and piggyback the OTHER list
+-- whenever it is also missing: this is the only work that touches every item
+-- id and by far the most visible first-run wait, so a user of both modes
+-- pays one walk instead of two.
+local function discoverIdLists(wantAffix, wantAttunable, onDone)
+    local affixIds = wantAffix and {} or nil
+    local attunableIds = wantAttunable and {} or nil
+    local startLevel = playerLevel()  -- see persistAttunableIds
+    local label = (wantAffix and wantAttunable) and "affixed + attunable items"
+        or (wantAffix and "affixed items" or "attunable items")
+    local progress = makeProgress(label)
+    runChunked(MAX_ITEMID, function(itemId)
+        if affixIds and itemHasRandomAffix(itemId) then
+            affixIds[#affixIds + 1] = itemId
+        end
+        if attunableIds and (safeFirst(IsAttunableBySomeone, itemId) or 0) ~= 0 then
+            attunableIds[#attunableIds + 1] = itemId
+        end
+    end, function()
+        if affixIds then
+            AF.affixedItemIds = affixIds
+            persistAffixIds(affixIds)
+        end
+        if attunableIds then
+            AF.attunableItemIds = attunableIds
+            AF.attunableItemIdsLevel = startLevel
+            persistAttunableIds(attunableIds, startLevel)
+        end
+        onDone()
+    end, progress)
+end
+
 local function ensureAffixedIds(onReady)
     local ready, reason = isCustomReady()
     if not ready then
@@ -1148,17 +1260,37 @@ local function ensureAffixedIds(onReady)
         return
     end
 
-    local ids = {}
-    local progress = makeProgress("affixed items")
-    runChunked(MAX_ITEMID, function(itemId)
-        if itemHasRandomAffix(itemId) then
-            ids[#ids + 1] = itemId
-        end
-    end, function()
-        AF.affixedItemIds = ids
-        persistAffixIds(ids)
+    discoverIdLists(true, currentAttunableIds() == nil, function()
+        onReady(AF.affixedItemIds)
+    end)
+end
+
+-- Finds (once per session) the item ids attunable by someone on the account --
+-- the candidate superset for both new-attunables scopes (character-attunable
+-- is a subset; the per-item gate re-checks the chosen scope live). Persisted
+-- across sessions with the MAX_ITEMID + level fingerprint above. Calls
+-- onReady(ids) or onReady(nil, errorText). isCustomReady already requires
+-- IsAttunableBySomeone, so no extra availability check is needed here.
+local function ensureAttunableIds(onReady)
+    local ready, reason = isCustomReady()
+    if not ready then
+        onReady(nil, reason)
+        return
+    end
+    if type(MAX_ITEMID) ~= "number" then
+        onReady(nil, "MAX_ITEMID is unavailable")
+        return
+    end
+    local ids = currentAttunableIds()
+    if ids then
         onReady(ids)
-    end, progress)
+        return
+    end
+
+    discoverIdLists(AF.affixedItemIds == nil and loadPersistedAffixIds() == nil, true,
+        function()
+            onReady(AF.attunableItemIds)
+        end)
 end
 
 local function newZoneRow(zoneName)
@@ -2034,11 +2166,13 @@ I.Scan = {
     addBreakdownCount = addBreakdownCount,
     affixedItemValue = affixedItemValue,
     beginTask = beginTask,
+    bestCreatureSource = bestCreatureSource,
     bitAnd = bitAnd,
     computeWithCache = computeWithCache,
     countBits32 = countBits32,
     endTask = endTask,
     ensureAffixedIds = ensureAffixedIds,
+    ensureAttunableIds = ensureAttunableIds,
     EV_MODE_LABELS = EV_MODE_LABELS,
     filterCaption = filterCaption,
     findZoneRow = findZoneRow,
@@ -2059,9 +2193,11 @@ I.Scan = {
     itemMatchesBind = itemMatchesBind,
     itemMatchesScope = itemMatchesScope,
     makeProgress = makeProgress,
+    newClassZoneTally = newClassZoneTally,
     newZoneRow = newZoneRow,
     printBreakdown = printBreakdown,
     reportScanError = reportScanError,
     runChunked = runChunked,
+    scopeForgeKey = scopeForgeKey,
     sortedBreakdown = sortedBreakdown,
 }

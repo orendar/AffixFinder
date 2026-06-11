@@ -3,9 +3,11 @@
 -- A single filterable browser window over the data the core already computes.
 --
 -- UX model:
---   * Shared filter bar (scope + forge) sits at the top because those filters
---     are cross-cutting: every panel shows the same scope/forge slice, and the
---     core caches results per scope+forge, so re-selecting one is instant.
+--   * Shared filter bar (mode + scope + forge + bind) sits at the top because
+--     those filters are cross-cutting: every panel shows the same slice (the
+--     "Find" mode picks WHAT is counted -- remaining affixes or whole items
+--     not yet attuned at all), and the core caches results per combination,
+--     so re-selecting one is instant.
 --   * Panels are tabs (Zones / Mobs / Current Zone). They are alternative views
 --     of the *same* filtered dataset, so switching tabs never rescans.
 --   * The list is virtualized (a fixed pool of row frames over a FauxScrollFrame)
@@ -245,6 +247,16 @@ local CATEGORY_LABELS = { dungeon = "Dungeon", raid = "Raid", world = "World" }
 local EXPANSION_LABELS = { classic = "Classic", tbc = "TBC", wotlk = "WotLK" }
 
 UI.filters = {
+    -- mode: the VALUE MODEL every shared panel ranks by. "affix" (default)
+    -- counts remaining random affixes (ComputeZoneData); "attune" counts whole
+    -- items not yet attuned at all (ComputeAttuneData) -- non-affixed items
+    -- never attuned, plus affixed items with zero affixes attuned, each worth
+    -- exactly one new attune. Item-level like scope/forge/bind (switching
+    -- modes switches datasets); in attune mode Forge is greyed out (a forged
+    -- attune also attunes base, so it cannot change what counts). Panels can
+    -- carry attuneColumns/attuneDefaultSort overrides for mode-specific
+    -- column semantics; the Resist panel ignores the mode entirely.
+    mode = "affix",
     scope = "character",
     forge = "none",
     bind = { bop = true, boe = true },
@@ -266,6 +278,12 @@ UI.filters = {
     -- panels' search boxes never contaminate each other.
     item = nil,
 }
+
+-- True when the shared panels are in new-attunables mode (the Resist panel
+-- pins itself to affix semantics via ignoresItemFilters).
+local function AttuneMode()
+    return UI.filters.mode == "attune"
+end
 
 local function CurrentForgeFilter()
     local key = UI.filters.forge or "none"
@@ -333,14 +351,22 @@ end
 -- the caption never echoes a category selection that does not apply to them.
 local function FilterCaption(skipCategoryNote)
     local scope = UI.filters.scope
-    local ff = CurrentForgeFilter()
     local bindLabel = AF.BindLabel and AF.BindLabel(CurrentBindFilter())
     local classNote = ""
     if UI.filters.class then
         classNote = ", " .. AF.ClassDisplayName(UI.filters.class)
     end
+    -- Attune mode replaces the forge note (forge never applies there) with the
+    -- mode itself, so every caption tells the truth about what is counted.
+    local modeNote
+    if AttuneMode() then
+        modeNote = ", new attunables"
+    else
+        local ff = CurrentForgeFilter()
+        modeNote = ", " .. tostring((ff and ff.label) or "None")
+    end
     return scope
-        .. ", " .. tostring((ff and ff.label) or "None")
+        .. modeNote
         .. (bindLabel and (", " .. bindLabel) or "")
         .. classNote
         .. (skipCategoryNote and "" or setNote(UI.filters.category, CATEGORY_ORDER, CATEGORY_LABELS))
@@ -531,6 +557,15 @@ PANELS[#PANELS + 1] = {
           headerTooltip = "Affixed items dropped here that you have not attuned at all yet.",
           value = function(e) return num(e.unattunedAffixedItems) end },
     },
+    -- In attune mode the three affix counts collapse into one number (every
+    -- unattuned item is worth exactly one attune), so show it once.
+    attuneColumns = {
+        { title = "Zone", width = 330, justify = "LEFT",
+          value = function(e) return e.zoneName or "" end },
+        { title = "Unattuned items", width = 130, justify = "RIGHT", numeric = true,
+          headerTooltip = "Items dropped by killable mobs here that you have not attuned at all yet (no affix attuned, or a non-affixed item never attuned).",
+          value = function(e) return num(e.unattunedAffixedItems) end },
+    },
     getRows = function(data)
         return AF.BuildZoneRankings(data, UI.filters.class)
     end,
@@ -542,13 +577,21 @@ PANELS[#PANELS + 1] = {
         if mi then UI.SelectPanel(mi) end  -- shows + syncs Mobs controls, refreshes
     end,
     summary = function(data, n)
+        local what = AttuneMode() and "items you haven't attuned at all"
+            or "remaining affix value"
         return string.format(
-            "%d zones with remaining affix value (%s, mob sources) -- click a zone to see its mobs",
-            n, FilterCaption())
+            "%d zones with %s (%s, mob sources) -- click a zone to see its mobs",
+            n, what, FilterCaption())
     end,
     tooltip = function(e)
-        local lines = { { left = e.zoneName, right = string.format("%d affixes left", num(e.totalAffixesLeft)) } }
-        local bd = e.breakdown and e.breakdown.totalAffixesLeft
+        local lines, bd
+        if AttuneMode() then
+            lines = { { left = e.zoneName, right = string.format("%d unattuned items", num(e.unattunedAffixedItems)) } }
+            bd = e.breakdown and e.breakdown.unattunedAffixedItems
+        else
+            lines = { { left = e.zoneName, right = string.format("%d affixes left", num(e.totalAffixesLeft)) } }
+            bd = e.breakdown and e.breakdown.totalAffixesLeft
+        end
         for _, r in ipairs(AF.SortedBreakdown(bd)) do
             lines[#lines + 1] = { left = "  " .. r.key, right = tostring(r.value) }
         end
@@ -588,6 +631,23 @@ PANELS[#PANELS + 1] = {
           headerTooltip = "Affixed items this mob drops that still have affixes left (a per-mob count -- nothing is summed across mobs).",
           value = function(e) return num(e.itemsDropped) end },
     },
+    -- Same shape in attune mode; only the value column's meaning changes.
+    attuneColumns = {
+        { title = "Mob", width = 168, justify = "LEFT",
+          value = function(e) return e.npcName or "?" end },
+        { title = "Zone", width = 150, justify = "LEFT",
+          value = function(e) return e.zoneName or "" end },
+        { title = "New/1k", width = 76, justify = "RIGHT", numeric = true,
+          headerTooltip = "Expected NEW item attunes per 1000 kills of this mob: the drop chances of the unattuned items it drops, summed. Every unattuned item counts once -- affix multiplicity is ignored in this mode.",
+          value = function(e) return num(e.evPerKill) * 1000 end,
+          text = function(e) return string.format("%.2f", num(e.evPerKill) * 1000) end },
+        { title = "Spawns", width = 64, justify = "RIGHT", numeric = true,
+          headerTooltip = "Reported spawn count for this mob -- higher means a denser pack to farm. The Min spawns box hides mobs below its value.",
+          value = function(e) return num(e.spawnedCount) end },
+        { title = "Items", width = 56, justify = "RIGHT", numeric = true,
+          headerTooltip = "Items this mob drops that you have not attuned at all yet (no affix attuned, or a non-affixed item never attuned).",
+          value = function(e) return num(e.itemsDropped) end },
+    },
     getRows = function(data, panel)
         local rows = AF.BuildMobList(data, panel.minSpawns, UI.filters.class)
         -- Mobs-only zone filter (case-insensitive substring on zoneName). The
@@ -610,8 +670,10 @@ PANELS[#PANELS + 1] = {
         local zf = UI.filters.zone
         local zonePart = (zf and zf ~= "") and string.format(" in zones matching \"%s\"", zf) or ""
         local warpPart = AF.GetConfig("automaticWarp") and " -- click a mob to pin/open map" or " -- click a mob to pin it"
-        return string.format("%d mobs%s (%s; min spawns %d) -- expected useful affix drops per 1000 kills%s",
-            n, zonePart, FilterCaption(), panel.minSpawns, warpPart)
+        local what = AttuneMode() and "expected new item attunes"
+            or "expected useful affix drops"
+        return string.format("%d mobs%s (%s; min spawns %d) -- %s per 1000 kills%s",
+            n, zonePart, FilterCaption(), panel.minSpawns, what, warpPart)
     end,
     onRowClick = function(entry)
         if AF.TryWarpToMob then
@@ -619,13 +681,24 @@ PANELS[#PANELS + 1] = {
         end
     end,
     tooltip = function(e)
-        local lines = {
-            { left = e.npcName or "?", right = e.zoneName },
-            { left = "  Useful affix drops / 1000 kills", right = string.format("%.2f", num(e.evPerKill) * 1000) },
-            { left = "  Reported spawn count", right = tostring(num(e.spawnedCount)) },
-            { left = "  Affixed items it drops (with affixes left)", right = tostring(num(e.itemsDropped)) },
-            { left = "  Remaining affixes across those items", right = tostring(num(e.affixesLeft)) },
-        }
+        local lines
+        if AttuneMode() then
+            lines = {
+                { left = e.npcName or "?", right = e.zoneName },
+                { left = "  New item attunes / 1000 kills", right = string.format("%.2f", num(e.evPerKill) * 1000) },
+                { left = "  Reported spawn count", right = tostring(num(e.spawnedCount)) },
+                { left = "  Unattuned items it drops", right = tostring(num(e.itemsDropped)) },
+                { left = "  Each item counts once (affixes ignored in this mode)." },
+            }
+        else
+            lines = {
+                { left = e.npcName or "?", right = e.zoneName },
+                { left = "  Useful affix drops / 1000 kills", right = string.format("%.2f", num(e.evPerKill) * 1000) },
+                { left = "  Reported spawn count", right = tostring(num(e.spawnedCount)) },
+                { left = "  Affixed items it drops (with affixes left)", right = tostring(num(e.itemsDropped)) },
+                { left = "  Remaining affixes across those items", right = tostring(num(e.affixesLeft)) },
+            }
+        end
         if AF.GetConfig("automaticWarp") then
             lines[#lines + 1] = { left = "  Click", right = "pin latest target and open t3 map" }
         else
@@ -666,6 +739,21 @@ PANELS[#PANELS + 1] = {
           headerTooltip = "Densest mob (by spawn count) that drops this item among the zones passing your filters. Click the row to pin it on the map.",
           value = function(e) return e.bestMobName or "" end },
     },
+    -- Attune mode: every listed item is simply "not attuned yet", so the affix
+    -- count columns disappear and the source columns get the room.
+    attuneColumns = {
+        { title = "Item", width = 240, justify = "LEFT",
+          value = function(e) return e._name or ("item " .. tostring(e.itemId)) end },
+        { title = "Category", width = 100, justify = "LEFT",
+          value = function(e) return e.category or "" end },
+        { title = "Best mob", width = 146, justify = "LEFT",
+          headerTooltip = "Densest mob (by spawn count) that drops this item among the zones passing your filters. Click the row to pin it on the map.",
+          value = function(e) return e.bestMobName or "" end },
+        { title = "Sources", width = 60, justify = "RIGHT", numeric = true,
+          headerTooltip = "Killable mobs that drop this item and pass your filters -- more sources means an easier farm.",
+          value = function(e) return num(e.sourceMobs) end },
+    },
+    attuneDefaultSort = 4,
     getRows = function(data, panel)
         -- No zone needle into BuildItemList: this panel searches by item name (or
         -- zone) below, so all items pass the spawn/class gate first.
@@ -707,19 +795,24 @@ PANELS[#PANELS + 1] = {
         local sf = UI.filters.item
         local searchPart = (sf and sf ~= "") and string.format(" matching \"%s\"", sf) or ""
         local warpPart = AF.GetConfig("automaticWarp") and " -- click an item to pin its best mob/open map" or " -- click an item to pin its best mob"
-        return string.format("%d items with affixes left%s (%s; min spawns %d)%s",
-            n, searchPart, FilterCaption(), panel.minSpawns, warpPart)
+        local what = AttuneMode() and "items you haven't attuned at all"
+            or "items with affixes left"
+        return string.format("%d %s%s (%s; min spawns %d)%s",
+            n, what, searchPart, FilterCaption(), panel.minSpawns, warpPart)
     end,
     tooltip = function(e)
         local lines = {
             { left = e._name or ("item " .. tostring(e.itemId)),
-              right = string.format("%d/%d affixes left", num(e.affixesLeft), num(e.possible)) },
+              right = AttuneMode() and "not attuned yet"
+                  or string.format("%d/%d affixes left", num(e.affixesLeft), num(e.possible)) },
             { left = "  Category", right = e.category or "?" },
             { left = "  Best mob", right = string.format("%s (%s, %d spawns)",
                 tostring(e.bestMobName or "?"), tostring(e.bestMobZone or "?"), num(e.bestMobSpawns)) },
             { left = "  Mobs that drop it (this filter)", right = tostring(num(e.sourceMobs)) },
         }
-        local names = AF.GetRemainingAffixNames
+        -- Suffix detail is affix-mode only; in attune mode one attune of
+        -- anything finishes the item, so there is nothing to enumerate.
+        local names = not AttuneMode() and AF.GetRemainingAffixNames
             and AF.GetRemainingAffixNames(e.itemId, 10, CurrentForgeFilter())
         if names and #names > 0 then
             lines[#lines + 1] = { left = "  Suffixes still needed:" }
@@ -771,6 +864,26 @@ PANELS[#PANELS + 1] = {
           headerTooltip = "Total spawns of every mob here that drops any affixed item -- a rough length/effort indicator. Instance trash does not respawn, so spawns closely track kills per clear.",
           value = function(e) return num(e.killsPerClear) end },
     },
+    -- Attune mode: identical layout; per-clear value counts new item attunes
+    -- and the kill denominator counts mobs dropping any ATTUNABLE item.
+    attuneColumns = {
+        { title = "Instance", width = 210, justify = "LEFT",
+          value = function(e) return e.zoneName or "" end },
+        { title = "Type", width = 70, justify = "LEFT",
+          headerTooltip = "Dungeon or raid. Raids are lockout-bound, so judge them by New/clear rather than density.",
+          value = function(e) return e.category == "raid" and "Raid" or "Dungeon" end },
+        { title = "New/clear", width = 96, justify = "RIGHT", numeric = true,
+          headerTooltip = "Expected NEW item attunes from one full clear: each mob's unattuned-item drop chances times its spawn count, summed over the instance. The number that matters for lockout-bound raids.",
+          value = function(e) return num(e.evPerClear) end,
+          text = function(e) return string.format("%.2f", num(e.evPerClear)) end },
+        { title = "Per 1k kills", width = 90, justify = "RIGHT", numeric = true,
+          headerTooltip = "New attunes per clear normalized per 1000 kills, counting every mob that drops any attunable item (needed or not), comparable to the Mobs tab's New/1k. Default sort: the efficiency number for resettable dungeons.",
+          value = function(e) return num(e.evPer1000) end,
+          text = function(e) return string.format("%.2f", num(e.evPer1000)) end },
+        { title = "Kills/clear", width = 80, justify = "RIGHT", numeric = true,
+          headerTooltip = "Total spawns of every mob here that drops any attunable item -- a rough length/effort indicator. Instance trash does not respawn, so spawns closely track kills per clear.",
+          value = function(e) return num(e.killsPerClear) end },
+    },
     getRows = function(data)
         local rows = AF.BuildInstanceRankings(data, UI.filters.class)
         -- Dungeon/Raid act as filters here; World never applies. If neither is
@@ -798,13 +911,24 @@ PANELS[#PANELS + 1] = {
             n, FilterCaption(true), catNote)
     end,
     tooltip = function(e)
-        local lines = {
-            { left = e.zoneName, right = e.category == "raid" and "Raid" or "Dungeon" },
-            { left = "  Affixes per full clear", right = string.format("%.2f", num(e.evPerClear)) },
-            { left = "  Kills per clear (affix-dropping mobs)", right = tostring(num(e.killsPerClear)) },
-            { left = "  Per 1000 of those kills", right = string.format("%.2f", num(e.evPer1000)) },
-            { left = "  Affixes left across its mobs", right = tostring(num(e.affixesLeft)) },
-        }
+        local lines
+        if AttuneMode() then
+            lines = {
+                { left = e.zoneName, right = e.category == "raid" and "Raid" or "Dungeon" },
+                { left = "  New item attunes per full clear", right = string.format("%.2f", num(e.evPerClear)) },
+                { left = "  Kills per clear (attunable-dropping mobs)", right = tostring(num(e.killsPerClear)) },
+                { left = "  Per 1000 of those kills", right = string.format("%.2f", num(e.evPer1000)) },
+                { left = "  Unattuned items across its mobs", right = tostring(num(e.affixesLeft)) },
+            }
+        else
+            lines = {
+                { left = e.zoneName, right = e.category == "raid" and "Raid" or "Dungeon" },
+                { left = "  Affixes per full clear", right = string.format("%.2f", num(e.evPerClear)) },
+                { left = "  Kills per clear (affix-dropping mobs)", right = tostring(num(e.killsPerClear)) },
+                { left = "  Per 1000 of those kills", right = string.format("%.2f", num(e.evPer1000)) },
+                { left = "  Affixes left across its mobs", right = tostring(num(e.affixesLeft)) },
+            }
+        end
         if e.contributors and #e.contributors > 0 then
             lines[#lines + 1] = { left = "  Top contributors:" }
             for _, c in ipairs(e.contributors) do
@@ -839,6 +963,17 @@ PANELS[#PANELS + 1] = {
           headerTooltip = "Total affixes left to attune across this category in the current zone.",
           value = function(e) return num(e.affixesLeft) end },
     },
+    -- Attune mode: the three counts are the same number, so show it once.
+    -- attuneDefaultSort is required wherever the affix default would index
+    -- past the (shorter) attune column set.
+    attuneColumns = {
+        { title = "Category", width = 330, justify = "LEFT",
+          value = function(e) return e.category or "" end },
+        { title = "Unattuned items", width = 130, justify = "RIGHT", numeric = true,
+          headerTooltip = "Items in this category, dropped by killable mobs here, that you have not attuned at all yet.",
+          value = function(e) return num(e.unattuned) end },
+    },
+    attuneDefaultSort = 2,
     getRows = function(data, panel)
         local zoneName = AF.GetCurrentZoneName()
         panel._zoneName = zoneName
@@ -876,6 +1011,14 @@ PANELS[#PANELS + 1] = {
     end,
     summary = function(data, n, panel)
         local row = panel._row
+        if AttuneMode() then
+            if not row then
+                return string.format("%s: nothing left to attune from killable mobs here (%s)",
+                    panel._zoneName or "?", FilterCaption())
+            end
+            return string.format("%s (%s): %d items you haven't attuned at all",
+                panel._zoneName or "?", FilterCaption(), num(row.unattunedAffixedItems))
+        end
         if not row then
             return string.format("%s: no affixes obtainable from killable mobs here (%s)",
                 panel._zoneName or "?", FilterCaption())
@@ -912,6 +1055,17 @@ PANELS[#PANELS + 1] = {
           headerTooltip = "Affixed items this class can use that are not yet attuned at all.",
           value = function(e) return num(e.unattunedAffixedItems) end },
     },
+    -- Attune mode: one count per class (the affix tallies collapse).
+    attuneColumns = {
+        { title = "Class", width = 200, justify = "LEFT",
+          value = function(e) return e.className or "" end,
+          text = function(e)
+              return (AF.ClassColorCode(e.classToken) or "") .. (e.className or "") .. "|r"
+          end },
+        { title = "Unattuned items", width = 130, justify = "RIGHT", numeric = true,
+          headerTooltip = "Items this class can use that you have not attuned at all yet (classes overlap, so these don't partition the account total).",
+          value = function(e) return num(e.unattunedAffixedItems) end },
+    },
     getRows = function(data)
         if UI.filters.scope ~= "account" then
             return {}
@@ -922,9 +1076,16 @@ PANELS[#PANELS + 1] = {
         if UI.filters.scope ~= "account" then
             return "Per-class breakdown is available in Account scope -- switch Scope to Account."
         end
-        return string.format("%d classes with remaining affix value (%s, mob sources)", n, FilterCaption())
+        local what = AttuneMode() and "items left to attune" or "remaining affix value"
+        return string.format("%d classes with %s (%s, mob sources)", n, what, FilterCaption())
     end,
     tooltip = function(e)
+        if AttuneMode() then
+            return {
+                { left = e.className, right = string.format("%d unattuned items", num(e.unattunedAffixedItems)) },
+                { left = "  Select this class above to re-slice the other panels." },
+            }
+        end
         return {
             { left = e.className, right = string.format("%d affixes left", num(e.totalAffixesLeft)) },
             { left = "  Items with affixes left", right = tostring(num(e.affixedItemsWithAffixesLeft)) },
@@ -1106,6 +1267,17 @@ PANELS[#PANELS + 1] = {
           headerTooltip = "Affixed items in this expansion with at least one affix left to attune.",
           value = function(e) return num(e.affixedItemsWithAffixesLeft) end },
     },
+    -- Attune mode: one count per expansion (the affix tallies collapse).
+    attuneColumns = {
+        { title = "Expansion", width = 200, justify = "LEFT",
+          value = function(e) return e.label or "" end },
+        { title = "Unattuned items", width = 130, justify = "RIGHT", numeric = true,
+          headerTooltip = "Farmable items in this expansion you have not attuned at all yet (this filter, killable mob sources).",
+          value = function(e) return num(e.unattunedAffixedItems) end },
+        { title = "Zones", width = 84, justify = "RIGHT", numeric = true,
+          headerTooltip = "Zones in this expansion that still have unattuned items.",
+          value = function(e) return num(e.zones) end },
+    },
     getRows = function(data)
         return AF.BuildExpansionBreakdown(data, ZonePasses, UI.filters.class)
     end,
@@ -1124,6 +1296,12 @@ PANELS[#PANELS + 1] = {
         return head .. string.format("farmable remaining by expansion (%s)", FilterCaption())
     end,
     tooltip = function(e)
+        if AttuneMode() then
+            return {
+                { left = e.label, right = string.format("%d unattuned items", num(e.unattunedAffixedItems)) },
+                { left = "  Zones with remaining value", right = tostring(num(e.zones)) },
+            }
+        end
         return {
             { left = e.label, right = string.format("%d affixes left", num(e.totalAffixesLeft)) },
             { left = "  Zones with remaining value", right = tostring(num(e.zones)) },
@@ -1146,13 +1324,46 @@ function UI.PanelIndexById(id)
     end
 end
 
+-- The value model a panel is actually showing: the shared panels follow
+-- UI.filters.mode, while a panel that ignores the item filters (Resist) is
+-- always affix-shaped regardless of the toggle.
+local function PanelMode(panel)
+    if panel and panel.ignoresItemFilters then
+        return "affix"
+    end
+    return UI.filters.mode or "affix"
+end
+
+-- The active column set / default sort for a panel: panels carry mode-specific
+-- overrides (attuneColumns/attuneDefaultSort) where attune mode changes the
+-- semantics; everything generic (layout, sorting, rendering, header tooltips)
+-- must read columns through here, never panel.columns directly.
+local function PanelColumns(panel)
+    if PanelMode(panel) == "attune" and panel.attuneColumns then
+        return panel.attuneColumns
+    end
+    return panel.columns
+end
+
+local function PanelDefaultSort(panel)
+    if PanelMode(panel) == "attune" and panel.attuneDefaultSort then
+        return panel.attuneDefaultSort
+    end
+    return panel.defaultSort or 1
+end
+
 -- A string identifying what dataset a panel needs, so tab-switching only rescans
--- when the dataset actually differs. The shared Zones/Mobs/Current/Classes panels
--- all read the same ComputeZoneData slice, so they share one signature; the
--- Resist panel declares its own (per element + scope) via panel.dataSig.
+-- when the dataset actually differs. The shared panels read the ComputeZoneData
+-- slice in affix mode and the ComputeAttuneData slice in attune mode (forge is
+-- not part of the attune signature -- it never applies there); the Resist panel
+-- declares its own (per element + scope) via panel.dataSig.
 local function PanelSig(panel)
     if panel.dataSig then
         return panel.dataSig(panel)
+    end
+    if PanelMode(panel) == "attune" then
+        return "attune:" .. UI.filters.scope
+            .. ":" .. (CurrentBindFilter() or "any")
     end
     return "zone:" .. UI.filters.scope
         .. ":" .. (UI.filters.forge or "none")
@@ -1229,9 +1440,35 @@ function UI.Build()
     local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", -6, -6)
 
-    -- Filter bar: Scope + Forge
+    -- Filter bar row 1: Find (the value model: affixes vs new attunables) +
+    -- Scope. Switching the mode switches datasets, so each panel's sort resets
+    -- to its mode default and the data is re-requested (cache makes flipping
+    -- back instant).
+    local findLabel = MakeText(f, "OVERLAY", "GameFontNormalSmall")
+    findLabel:SetPoint("TOPLEFT", PAD, -44)
+    findLabel:SetText("Find:")
+
+    local modeSeg = CreateSegmented(f, {
+        { value = "affix", text = "Affixes", width = 64 },
+        { value = "attune", text = "New items", width = 80 },
+    }, function(value)
+        UI.filters.mode = value
+        for _, p in ipairs(PANELS) do
+            p.sortCol = nil  -- re-apply each panel's per-mode default sort
+        end
+        UI.UpdateFilterControlState()
+        UI.SelectPanel(UI.activePanelIndex)  -- relays columns + requests data
+    end)
+    local prev = findLabel
+    local gx = 6
+    for _, b in ipairs(modeSeg.buttons) do
+        b:ClearAllPoints()
+        b:SetPoint("LEFT", prev, "RIGHT", gx, 0)
+        prev = b; gx = 2
+    end
+
     local scopeLabel = MakeText(f, "OVERLAY", "GameFontNormalSmall")
-    scopeLabel:SetPoint("TOPLEFT", PAD, -44)
+    scopeLabel:SetPoint("LEFT", prev, "RIGHT", 18, 0)
     scopeLabel:SetText("Scope:")
 
     local scopeSeg = CreateSegmented(f, {
@@ -1242,16 +1479,17 @@ function UI.Build()
         UI.UpdateClassControl()
         UI.RequestData()
     end)
-    local prev = scopeLabel
-    local gx = 6
+    prev = scopeLabel; gx = 6
     for _, b in ipairs(scopeSeg.buttons) do
         b:ClearAllPoints()
         b:SetPoint("LEFT", prev, "RIGHT", gx, 0)
         prev = b; gx = 2
     end
 
+    -- Filter bar row 2: Forge (item-level; affix mode only) + Bind (multi,
+    -- item-level -> rescan)
     local forgeLabel = MakeText(f, "OVERLAY", "GameFontNormalSmall")
-    forgeLabel:SetPoint("LEFT", prev, "RIGHT", 18, 0)
+    forgeLabel:SetPoint("TOPLEFT", PAD, -70)
     forgeLabel:SetText("Forge:")
 
     local forgeSeg = CreateSegmented(f, {
@@ -1270,10 +1508,8 @@ function UI.Build()
         prev = b; gx = 2
     end
 
-    -- Filter bar row 2: Bind (multi, item-level -> rescan) + Source (multi,
-    -- zone-level -> display-time)
     local bindLabel = MakeText(f, "OVERLAY", "GameFontNormalSmall")
-    bindLabel:SetPoint("TOPLEFT", PAD, -70)
+    bindLabel:SetPoint("LEFT", prev, "RIGHT", 18, 0)
     bindLabel:SetText("Bind:")
 
     local bindSeg = CreateMultiSegmented(f, {
@@ -1289,8 +1525,9 @@ function UI.Build()
         prev = b; gx = 2
     end
 
+    -- Filter bar row 3: Source + Expansion (multi, zone-level -> display-time)
     local sourceLabel = MakeText(f, "OVERLAY", "GameFontNormalSmall")
-    sourceLabel:SetPoint("LEFT", prev, "RIGHT", 18, 0)
+    sourceLabel:SetPoint("TOPLEFT", PAD, -96)
     sourceLabel:SetText("Source:")
 
     local sourceSeg = CreateMultiSegmented(f, {
@@ -1307,9 +1544,8 @@ function UI.Build()
         prev = b; gx = 2
     end
 
-    -- Filter bar row 3: Expansion (multi, zone-level -> display-time)
     local expLabel = MakeText(f, "OVERLAY", "GameFontNormalSmall")
-    expLabel:SetPoint("TOPLEFT", PAD, -96)
+    expLabel:SetPoint("LEFT", prev, "RIGHT", 18, 0)
     expLabel:SetText("Expansion:")
 
     local expSeg = CreateMultiSegmented(f, {
@@ -1326,10 +1562,11 @@ function UI.Build()
         prev = b; gx = 2
     end
 
-    -- Class selector (account scope only). Display-time re-slice -> no rescan.
-    -- A dropdown (not segmented buttons) because there are 11 options.
+    -- Filter bar row 4: Class selector (account scope only). Display-time
+    -- re-slice -> no rescan. A dropdown (not segmented buttons) because there
+    -- are 11 options.
     local classLabel = MakeText(f, "OVERLAY", "GameFontNormalSmall")
-    classLabel:SetPoint("LEFT", prev, "RIGHT", 18, 0)
+    classLabel:SetPoint("TOPLEFT", PAD, -122)
     classLabel:SetText("Class:")
 
     local classDD = CreateFrame("Frame", "AffixFinderClassDropDown", f, "UIDropDownMenuTemplate")
@@ -1364,11 +1601,13 @@ function UI.Build()
     UI.classDD = classDD
     UI.classAllLabel = ALL_CLASSES_LABEL
 
+    UI.modeSeg = modeSeg
     UI.scopeSeg = scopeSeg
     UI.forgeSeg = forgeSeg
     UI.bindSeg = bindSeg
     UI.sourceSeg = sourceSeg
     UI.expSeg = expSeg
+    UI.findLabel = findLabel
     UI.forgeLabel = forgeLabel
     UI.bindLabel = bindLabel
     UI.sourceLabel = sourceLabel
@@ -1377,7 +1616,7 @@ function UI.Build()
     -- overflow the frame; everything below is positioned off the last row (and
     -- the frame height follows), so adding a panel never needs offset surgery.
     UI.tabButtons = {}
-    local tx, ty = PAD, -124
+    local tx, ty = PAD, -150
     for i, panel in ipairs(PANELS) do
         local b = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
         b:SetHeight(22)
@@ -1439,7 +1678,7 @@ function UI.Build()
         hb:SetScript("OnClick", function() UI.ToggleSort(i) end)
         hb:SetScript("OnEnter", function(s)
             s.label:SetTextColor(1, 1, 1)
-            local col = ActivePanel().columns[s.colIndex]
+            local col = PanelColumns(ActivePanel())[s.colIndex]
             if col and col.headerTooltip then
                 GameTooltip:SetOwner(s, "ANCHOR_TOP")
                 GameTooltip:AddLine(col.title, 1, 1, 1)
@@ -1577,6 +1816,7 @@ function UI.Build()
     end)
 
     -- Initialise selection state (multi-selects applied themselves on build).
+    modeSeg:SetValue(UI.filters.mode, false)
     scopeSeg:SetValue(UI.filters.scope, false)
     forgeSeg:SetValue(UI.filters.forge, false)
     UI.UpdateClassControl()
@@ -1619,10 +1859,15 @@ function UI.UpdateFilterControlState()
     if not UI.forgeSeg then return end
     local panel = PANELS[UI.activePanelIndex]
     local itemFiltersApply = not (panel and panel.ignoresItemFilters)
+    -- Forge only matters in affix mode (a forged attune also attunes base, so
+    -- it cannot change what counts as a new attunable).
+    local forgeApplies = itemFiltersApply and PanelMode(panel) ~= "attune"
 
-    UI.forgeSeg:SetEnabled(itemFiltersApply)
+    UI.modeSeg:SetEnabled(itemFiltersApply)
+    setLabelEnabled(UI.findLabel, itemFiltersApply)
+    UI.forgeSeg:SetEnabled(forgeApplies)
     UI.bindSeg:SetEnabled(itemFiltersApply)
-    setLabelEnabled(UI.forgeLabel, itemFiltersApply)
+    setLabelEnabled(UI.forgeLabel, forgeApplies)
     setLabelEnabled(UI.bindLabel, itemFiltersApply)
 
     -- The Instances tab is dungeons+raids by definition: World is locked out
@@ -1675,9 +1920,10 @@ function UI.SelectPanel(index, skipRequest)
     -- Grey out filters this panel ignores (e.g. Forge/Bind/Class on Resist).
     UI.UpdateFilterControlState()
 
-    -- Lay out column headers for this panel.
+    -- Lay out column headers for this panel (mode-aware column set).
+    local columns = PanelColumns(panel)
     for i, hb in ipairs(UI.headerButtons) do
-        local col = panel.columns[i]
+        local col = columns[i]
         if col then
             hb.label:ClearAllPoints()
             hb.arrow:ClearAllPoints()
@@ -1695,24 +1941,25 @@ function UI.SelectPanel(index, skipRequest)
             end
         end
     end
-    LayoutColumns(UI.headerButtons, panel.columns, UI.headerHost)
+    LayoutColumns(UI.headerButtons, columns, UI.headerHost)
 
     -- Lay out the cells in every row for this panel.
     for _, row in ipairs(UI.rows) do
         for i, cell in ipairs(row.cells) do
-            local col = panel.columns[i]
+            local col = columns[i]
             if col then
                 cell:SetJustifyH(col.justify or "LEFT")
             end
         end
-        LayoutColumns(row.cells, panel.columns, row)
+        LayoutColumns(row.cells, columns, row)
     end
 
-    -- Default sort for the panel (numeric -> desc, text -> asc).
-    local sc = panel.sortCol or panel.defaultSort or 1
+    -- Default sort for the panel (numeric -> desc, text -> asc). sortCol is
+    -- reset to nil on a mode switch so the per-mode default re-applies here.
+    local sc = panel.sortCol or PanelDefaultSort(panel)
     if panel.sortCol == nil then
         panel.sortCol = sc
-        panel.sortAsc = not panel.columns[sc].numeric
+        panel.sortAsc = not columns[sc].numeric
     end
 
     if not skipRequest then
@@ -1728,12 +1975,13 @@ end
 
 function UI.ToggleSort(colIndex)
     local panel = ActivePanel()
-    if not panel.columns[colIndex] then return end
+    local columns = PanelColumns(panel)
+    if not columns[colIndex] then return end
     if panel.sortCol == colIndex then
         panel.sortAsc = not panel.sortAsc
     else
         panel.sortCol = colIndex
-        panel.sortAsc = not panel.columns[colIndex].numeric
+        panel.sortAsc = not columns[colIndex].numeric
     end
     UI.RefreshActivePanel()
 end
@@ -1804,9 +2052,13 @@ function UI.RequestData()
     end
 
     -- A panel may declare its own data source (Resist -> ComputeResistData);
-    -- otherwise use the shared scope/forge/bind ComputeZoneData slice.
+    -- otherwise the shared panels read the mode's slice: scope/forge/bind
+    -- ComputeZoneData in affix mode, scope/bind ComputeAttuneData in attune
+    -- mode (forge never applies there).
     if panel.fetch then
         panel.fetch(panel, handle)
+    elseif PanelMode(panel) == "attune" then
+        AF.ComputeAttuneData(UI.filters.scope, CurrentBindFilter(), handle)
     else
         AF.ComputeZoneData(UI.filters.scope, CurrentForgeFilter(), CurrentBindFilter(), handle)
     end
@@ -1865,10 +2117,11 @@ function UI.RefreshActivePanel()
         entries = filtered
     end
 
-    -- Apply the active column sort.
+    -- Apply the active column sort (mode-aware column set).
+    local columns = PanelColumns(panel)
     local sc = panel.sortCol
-    if sc and panel.columns[sc] then
-        local col = panel.columns[sc]
+    if sc and columns[sc] then
+        local col = columns[sc]
         local asc = panel.sortAsc
         table.sort(entries, function(a, b)
             local va, vb = col.value(a), col.value(b)
@@ -1885,7 +2138,7 @@ function UI.RefreshActivePanel()
 
     -- Header arrows.
     for i, hb in ipairs(UI.headerButtons) do
-        if panel.columns[i] and i == sc then
+        if columns[i] and i == sc then
             hb.arrow:Show()
             -- UI-SortArrow points up; flip vertically for descending.
             if panel.sortAsc then
@@ -1920,8 +2173,9 @@ function UI.RefreshActivePanel()
             cacheState = "stale -- Rescan to refresh"
         end
     end
-    UI.statusText:SetText(string.format("%d rows  |  %d affixed items with mob sources  |  %s",
-        #entries, scanned, cacheState))
+    local itemsNoun = (PanelMode(panel) == "attune") and "unattuned items" or "affixed items"
+    UI.statusText:SetText(string.format("%d rows  |  %d %s with mob sources  |  %s",
+        #entries, scanned, itemsNoun, cacheState))
 
     if #entries == 0 then
         UI.SetOverlay("Nothing to show for these filters.")
@@ -1935,6 +2189,7 @@ end
 function UI.RefreshList()
     local entries = UI.currentEntries or {}
     local panel = ActivePanel()
+    local columns = PanelColumns(panel)
     local n = #entries
 
     FauxScrollFrame_Update(UI.scroll, n, NUM_ROWS, ROW_H)
@@ -1947,7 +2202,7 @@ function UI.RefreshList()
         if entry and idx <= n then
             row.entry = entry
             for c = 1, MAX_COLS do
-                local col = panel.columns[c]
+                local col = columns[c]
                 local cell = row.cells[c]
                 if col then
                     local text = col.text and col.text(entry) or tostring(col.value(entry))
@@ -1971,6 +2226,7 @@ end
 function AF.ShowUI()
     UI.Build()
     UI.frame:Show()
+    UI.modeSeg:SetValue(UI.filters.mode, false)
     UI.scopeSeg:SetValue(UI.filters.scope, false)
     UI.forgeSeg:SetValue(UI.filters.forge, false)
     if UI.data then

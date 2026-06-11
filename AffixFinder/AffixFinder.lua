@@ -32,6 +32,22 @@ AF.zoneData = {}
 AF.resistData = {}
 AF.resistIndexByElement = nil
 
+-- New-attunables mode caches (AffixFinderAttune.lua): farm targets for items
+-- the player has not attuned AT ALL yet, regardless of affixes. Same transient
+-- model as the others.
+--   attunableItemIds : list of item ids attunable by someone on the account --
+--                      the candidate superset for both scopes. Persisted in
+--                      AffixFinderDB.attunableCache like affixCache, but
+--                      fingerprinted by MAX_ITEMID + character level, since
+--                      attunability grows as characters level (see
+--                      AffixFinderAttune.lua). attunableItemIdsLevel is the
+--                      session memo's own level stamp -- the scan re-checks it
+--                      so a mid-session level-up forces rediscovery.
+--   attuneData       : aggregated results keyed by scope+bind+mythics.
+AF.attunableItemIds = nil
+AF.attunableItemIdsLevel = nil
+AF.attuneData = {}
+
 -- ---------------------------------------------------------------------------
 -- Configuration (persisted in SavedVariables by AffixFinderConfig.lua). Only a
 -- few scalars are stored -- never the item graph or source data -- so this has
@@ -116,6 +132,9 @@ function AF.ClearDynamicData()
     for _, data in pairs(AF.resistData or {}) do
         data.dirty = true
     end
+    for _, data in pairs(AF.attuneData or {}) do
+        data.dirty = true
+    end
     if type(AF.InvalidateTooltipMemo) == "function" then
         AF.InvalidateTooltipMemo()
     end
@@ -128,8 +147,12 @@ function AF.ClearAll()
     AF.affixedItemIds = nil
     AF.zoneData = {}
     AF.resistData = {}
+    AF.attunableItemIds = nil
+    AF.attunableItemIdsLevel = nil
+    AF.attuneData = {}
     if type(_G.AffixFinderDB) == "table" then
         _G.AffixFinderDB.affixCache = nil
+        _G.AffixFinderDB.attunableCache = nil
     end
     if type(AF.InvalidateTooltipMemo) == "function" then
         AF.InvalidateTooltipMemo()

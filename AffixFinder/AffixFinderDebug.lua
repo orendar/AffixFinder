@@ -902,16 +902,25 @@ local function printMemReport()
 
     chat("Affixed item ids: " .. (AF.affixedItemIds and #AF.affixedItemIds or 0)
         .. " (" .. (AF.affixedItemIds and "discovered" or "not yet discovered") .. ")")
+    chat("Attunable item ids: " .. (AF.attunableItemIds and #AF.attunableItemIds or 0)
+        .. " (" .. (AF.attunableItemIds and "discovered" or "not yet discovered") .. ")")
 
-    local combos = 0
-    local totalRows = 0
-    local totalMobs = 0
-    for _, data in pairs(AF.zoneData) do
-        combos = combos + 1
-        totalRows = totalRows + #data.rows
-        totalMobs = totalMobs + countEntries(data.mobsByKey)
+    local function cacheSummary(store)
+        local combos = 0
+        local totalRows = 0
+        local totalMobs = 0
+        for _, data in pairs(store or {}) do
+            combos = combos + 1
+            totalRows = totalRows + #data.rows
+            totalMobs = totalMobs + countEntries(data.mobsByKey)
+        end
+        return combos, totalRows, totalMobs
     end
+    local combos, totalRows, totalMobs = cacheSummary(AF.zoneData)
     chat("Cached scope/forge/bind results: " .. combos
+        .. " (" .. totalRows .. " zone rows, " .. totalMobs .. " mob aggregates)")
+    combos, totalRows, totalMobs = cacheSummary(AF.attuneData)
+    chat("Cached new-attunable results: " .. combos
         .. " (" .. totalRows .. " zone rows, " .. totalMobs .. " mob aggregates)")
 end
 

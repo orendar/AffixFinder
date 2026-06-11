@@ -10,6 +10,7 @@ local FORGE_FLAGS = I.FORGE_FLAGS
 local Output = I.Output
 local Debug = I.Debug
 local printScan = Output.printScan
+local printAttuneRankings = Output.printAttuneRankings
 local printInstanceRankings = Output.printInstanceRankings
 local printZoneRankings = Output.printZoneRankings
 local printZoneExpectedValue = Output.printZoneExpectedValue
@@ -94,6 +95,12 @@ local function parseOptions(msg)
             options.affixDbg = true
         elseif token == "resist" or token == "res" then
             options.mode = "resist"
+        elseif token == "attune" or token == "attunables" or token == "att" or token == "new" then
+            -- A flag, not a mode: it combines with `instances` ("/af attune
+            -- instances" and "/af instances attune" both rank full clears by
+            -- new item attunes). Alone, it resolves to the attune mode after
+            -- the loop.
+            options.attune = true
         elseif AF.RESIST_ELEMENTS[token] then
             options.resistElement = token
         elseif token == "mem" or token == "memory" then
@@ -128,7 +135,8 @@ local function parseOptions(msg)
                 else
                     options.limit = number or options.limit
                 end
-            elseif options.ev or options.mode == "resist" then
+            elseif options.ev or options.mode == "resist"
+                or (options.attune and options.mode ~= "instances") then
                 evNumbersSeen = evNumbersSeen + 1
                 if evNumbersSeen == 1 then
                     options.minSpawns = number or options.minSpawns
@@ -146,6 +154,11 @@ local function parseOptions(msg)
         end
     end
 
+    -- A bare `attune` (no explicit view) means the attune zone rankings.
+    if options.attune and options.mode == "current" then
+        options.mode = "attune"
+    end
+
     return options
 end
 
@@ -159,6 +172,9 @@ local function printUsage()
     chat("  e.g. /af zones ev 5, /af zones acc ev total 10, /af zones ev avg 1 20")
     chat("Specific resist: /af resist <fire|nature|frost|shadow|arcane> [char|acc] [best|avg|total] [N] [limit]")
     chat("  e.g. /af resist fire, /af resist frost acc 5, /af resist arcane total 1 15")
+    chat("New attunables: /af attune [char|acc] [bop|boe|both] [best|avg|total] [N] [limit]")
+    chat("  (items you haven't attuned at all, affixes ignored; forge never applies)")
+    chat("  /af attune instances [char|acc] [bop|boe|both] [limit] (full-clear new-item value)")
     chat("Debug: /af debug <itemId|link> [maxRows], /af zonedbg (zone classification)")
     chat("  /af zonedump [char|acc] [none|tf|wf|lf] [bop|boe|both] [sampleRows] (current-zone item gates)")
     chat("  /af warp (current-zone T3 warp-tier probe for the map-warp assist)")
@@ -227,6 +243,8 @@ SlashCmdList["AFFIXFINDER"] = function(msg)
         printResistValue(options)
     elseif options.mode == "resist" then
         printResistRankings(options)
+    elseif options.mode == "attune" then
+        printAttuneRankings(options)
     elseif options.mode == "zonedbg" then
         printZoneClassification(options)
     elseif options.mode == "zonedump" then
@@ -248,11 +266,21 @@ end
 
 local frame = CreateFrame("Frame")
 frame:RegisterEvent("CHAT_MSG_SYSTEM")
+frame:RegisterEvent("PLAYER_LEVEL_UP")
 frame:SetScript("OnEvent", function(_, event, arg1)
     if event == "CHAT_MSG_SYSTEM" then
         -- Attuning changes how many affixes are left; drop cached aggregates.
         if type(arg1) == "string" and string.find(arg1, "You have attuned with", 1, true) then
             AF.ClearDynamicData()
         end
+    elseif event == "PLAYER_LEVEL_UP" then
+        -- Leveling changes what is attunable: new items unlock for the
+        -- attunable-candidate list, and character-scope CanAttuneItemHelper
+        -- answers change. Mark every cached slice stale (the rescan interval
+        -- rate-limits the recompute, exactly like attuning does); the
+        -- candidate list itself re-validates lazily against its level stamp
+        -- on the next scan (see AffixFinderAttune.lua), so no cache needs
+        -- dropping here.
+        AF.ClearDynamicData()
     end
 end)

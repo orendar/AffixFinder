@@ -134,11 +134,16 @@ end
 -- Ranks full dungeon/raid clears (the UI's Instances tab, in chat form):
 -- expected affixes per clear and per 1000 kills of affix-dropping mobs.
 -- Sorted by density like the tab's default sort; shares the scope/forge/bind
--- and limit semantics of /af zones.
+-- and limit semantics of /af zones. With options.attune ("/af attune
+-- instances") the value model is NEW item attunes instead -- the slice comes
+-- from ComputeAttuneData (forge never applies there; bind does) and the kill
+-- denominator counts attunable-dropping mobs.
 local function printInstanceRankings(options)
     local scope = options.scope or AF.defaultScope or "character"
     local forgeFilter = options.forgeFilter
-    AF.ComputeZoneData(scope, forgeFilter, options.bindFilter, function(data, err)
+    local attune = options.attune and true or false
+
+    local function handle(data, err)
         if not data then
             reportScanError(err, "scan instances")
             return
@@ -150,10 +155,19 @@ local function printInstanceRankings(options)
             limit = AF.defaultZoneLimit
         end
 
-        chat("Top instances by full-clear value (" .. filterCaption(scope, forgeFilter, options.bindFilter)
-            .. "; " .. #rows .. " instances; sorted by affixes/1000 kills; kills count affix-dropping mobs)")
+        if attune then
+            local bindLabel = AF.BindLabel(options.bindFilter)
+            chat("Top instances by full-clear new item attunes (" .. scope
+                .. (bindLabel and (", " .. bindLabel) or "")
+                .. "; " .. #rows .. " instances; sorted by new attunes/1000 kills;"
+                .. " kills count attunable-dropping mobs)")
+        else
+            chat("Top instances by full-clear value (" .. filterCaption(scope, forgeFilter, options.bindFilter)
+                .. "; " .. #rows .. " instances; sorted by affixes/1000 kills; kills count affix-dropping mobs)")
+        end
         if #rows == 0 then
-            chat("No dungeons or raids with remaining affix value found.")
+            chat(attune and "No dungeons or raids with unattuned items found."
+                or "No dungeons or raids with remaining affix value found.")
             return
         end
 
@@ -165,7 +179,13 @@ local function printInstanceRankings(options)
                 .. string.format("%.2f", r.evPerClear or 0) .. " per clear, ~"
                 .. tostring(r.killsPerClear or 0) .. " kills/clear")
         end
-    end)
+    end
+
+    if attune then
+        AF.ComputeAttuneData(scope, options.bindFilter, handle)
+    else
+        AF.ComputeZoneData(scope, forgeFilter, options.bindFilter, handle)
+    end
 end
 
 -- Ranks zones by how often a chosen resist would roll on a killable drop
@@ -231,8 +251,64 @@ local function printResistRankings(options)
     end)
 end
 
+-- Ranks zones by expected NEW item attunes per 1000 kills (items the player
+-- has not attuned at all -- see AffixFinderAttune.lua), reusing the generic EV
+-- builder over the new-attunables slice. Shares the spawn-threshold / mode /
+-- limit semantics of /af zones ev. Forge never applies; bind does.
+local function printAttuneRankings(options)
+    local scope = options.scope or AF.defaultScope or "character"
+    local evMode = options.evMode or "best"
+    local minSpawns = tonumber(options.minSpawns) or 1
+    if minSpawns < 0 then
+        minSpawns = 0
+    end
+
+    AF.ComputeAttuneData(scope, options.bindFilter, function(data, err)
+        if not data then
+            reportScanError(err, "scan new attunables")
+            return
+        end
+
+        local zones, zonesDiscovered, mobsBelowThreshold = AF.BuildZoneEV(data, evMode, minSpawns)
+        local limit = tonumber(options.limit) or AF.defaultZoneLimit
+        if limit < 1 then
+            limit = AF.defaultZoneLimit
+        end
+        local bindLabel = AF.BindLabel(options.bindFilter)
+        local modeLabel = EV_MODE_LABELS[evMode] or evMode
+        chat("New attunables: top zones by new item attunes/1000 kills (" .. scope
+            .. (bindLabel and (", " .. bindLabel) or "")
+            .. "; " .. modeLabel .. "; min spawns " .. minSpawns
+            .. "; matched " .. #zones .. "/" .. zonesDiscovered
+            .. " zones; items you haven't attuned at all, affixes ignored)")
+
+        if #zones == 0 then
+            chat("No qualifying mobs found (" .. mobsBelowThreshold
+                .. " below the spawn threshold of " .. minSpawns
+                .. "). Everything killable may already be attuned for this filter.")
+            return
+        end
+
+        local shown = math.min(limit, #zones)
+        for i = 1, shown do
+            local zone = zones[i]
+            local detail
+            if evMode == "best" then
+                detail = "best mob " .. tostring(zone.bestMobName or "?")
+                    .. " (" .. tostring(zone.bestMobSpawns or 0) .. " spawns, "
+                    .. tostring(zone.bestMobItems or 0) .. " unattuned items)"
+            else
+                detail = tostring(zone.qualifyingMobs or 0) .. " mobs"
+            end
+            chat(i .. ". " .. zone.zoneName .. ": "
+                .. string.format("%.2f", zone.score or 0) .. " new attunes/1000 kills, " .. detail)
+        end
+    end)
+end
+
 
 I.Output = {
+    printAttuneRankings = printAttuneRankings,
     printInstanceRankings = printInstanceRankings,
     printResistRankings = printResistRankings,
     printScan = printScan,
