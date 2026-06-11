@@ -249,13 +249,14 @@ local EXPANSION_LABELS = { classic = "Classic", tbc = "TBC", wotlk = "WotLK" }
 UI.filters = {
     -- mode: the VALUE MODEL every shared panel ranks by. "affix" (default)
     -- counts remaining random affixes (ComputeZoneData); "attune" counts whole
-    -- items not yet attuned at all (ComputeAttuneData) -- non-affixed items
-    -- never attuned, plus affixed items with zero affixes attuned, each worth
+    -- items not yet attuned (ComputeAttuneData) -- with Forge at None that is
+    -- the game's binary sense (non-affixed items never attuned, plus affixed
+    -- items with zero affixes attuned), while a forged threshold narrows it
+    -- to items not yet attuned at that forge level or higher, each worth
     -- exactly one new attune. Item-level like scope/forge/bind (switching
-    -- modes switches datasets); in attune mode Forge is greyed out (a forged
-    -- attune also attunes base, so it cannot change what counts). Panels can
-    -- carry attuneColumns/attuneDefaultSort overrides for mode-specific
-    -- column semantics; the Resist panel ignores the mode entirely.
+    -- modes switches datasets). Panels can carry attuneColumns/
+    -- attuneDefaultSort overrides for mode-specific column semantics; the
+    -- Resist panel ignores the mode entirely.
     mode = "affix",
     scope = "character",
     forge = "none",
@@ -288,6 +289,26 @@ end
 local function CurrentForgeFilter()
     local key = UI.filters.forge or "none"
     return AF.FORGE_FLAGS and (AF.FORGE_FLAGS[key] or AF.FORGE_FLAGS.none) or nil
+end
+
+-- What "unattuned" means in attune mode under the current forge threshold,
+-- for summaries: the base filter is the game's binary sense, a forged filter
+-- narrows it to that level or higher.
+local function AttuneWhat()
+    local ff = CurrentForgeFilter()
+    if ff and (tonumber(ff.minLevel) or 0) > 0 then
+        return "items you haven't attuned at " .. tostring(ff.label)
+    end
+    return "items you haven't attuned at all"
+end
+
+-- The per-item form of AttuneWhat, for row tooltips.
+local function AttuneItemLabel()
+    local ff = CurrentForgeFilter()
+    if ff and (tonumber(ff.minLevel) or 0) > 0 then
+        return "not attuned at " .. tostring(ff.label)
+    end
+    return "not attuned yet"
 end
 
 -- Reduce the bind set to core's single bindFilter: nil (both), "bop", or "boe".
@@ -356,13 +377,18 @@ local function FilterCaption(skipCategoryNote)
     if UI.filters.class then
         classNote = ", " .. AF.ClassDisplayName(UI.filters.class)
     end
-    -- Attune mode replaces the forge note (forge never applies there) with the
-    -- mode itself, so every caption tells the truth about what is counted.
+    -- Attune mode leads with the mode itself; the forge note follows in BOTH
+    -- modes (in attune mode it is the attunement threshold), so every caption
+    -- tells the truth about what is counted. The base threshold stays silent
+    -- in attune mode -- "new attunables" already means "never attuned".
+    local ff = CurrentForgeFilter()
     local modeNote
     if AttuneMode() then
         modeNote = ", new attunables"
+        if ff and (tonumber(ff.minLevel) or 0) > 0 then
+            modeNote = modeNote .. ", " .. tostring(ff.label)
+        end
     else
-        local ff = CurrentForgeFilter()
         modeNote = ", " .. tostring((ff and ff.label) or "None")
     end
     return scope
@@ -577,7 +603,7 @@ PANELS[#PANELS + 1] = {
         if mi then UI.SelectPanel(mi) end  -- shows + syncs Mobs controls, refreshes
     end,
     summary = function(data, n)
-        local what = AttuneMode() and "items you haven't attuned at all"
+        local what = AttuneMode() and AttuneWhat()
             or "remaining affix value"
         return string.format(
             "%d zones with %s (%s, mob sources) -- click a zone to see its mobs",
@@ -795,7 +821,7 @@ PANELS[#PANELS + 1] = {
         local sf = UI.filters.item
         local searchPart = (sf and sf ~= "") and string.format(" matching \"%s\"", sf) or ""
         local warpPart = AF.GetConfig("automaticWarp") and " -- click an item to pin its best mob/open map" or " -- click an item to pin its best mob"
-        local what = AttuneMode() and "items you haven't attuned at all"
+        local what = AttuneMode() and AttuneWhat()
             or "items with affixes left"
         return string.format("%d %s%s (%s; min spawns %d)%s",
             n, what, searchPart, FilterCaption(), panel.minSpawns, warpPart)
@@ -803,7 +829,7 @@ PANELS[#PANELS + 1] = {
     tooltip = function(e)
         local lines = {
             { left = e._name or ("item " .. tostring(e.itemId)),
-              right = AttuneMode() and "not attuned yet"
+              right = AttuneMode() and AttuneItemLabel()
                   or string.format("%d/%d affixes left", num(e.affixesLeft), num(e.possible)) },
             { left = "  Category", right = e.category or "?" },
             { left = "  Best mob", right = string.format("%s (%s, %d spawns)",
@@ -1016,8 +1042,8 @@ PANELS[#PANELS + 1] = {
                 return string.format("%s: nothing left to attune from killable mobs here (%s)",
                     panel._zoneName or "?", FilterCaption())
             end
-            return string.format("%s (%s): %d items you haven't attuned at all",
-                panel._zoneName or "?", FilterCaption(), num(row.unattunedAffixedItems))
+            return string.format("%s (%s): %d %s",
+                panel._zoneName or "?", FilterCaption(), num(row.unattunedAffixedItems), AttuneWhat())
         end
         if not row then
             return string.format("%s: no affixes obtainable from killable mobs here (%s)",
@@ -1355,14 +1381,15 @@ end
 -- A string identifying what dataset a panel needs, so tab-switching only rescans
 -- when the dataset actually differs. The shared panels read the ComputeZoneData
 -- slice in affix mode and the ComputeAttuneData slice in attune mode (forge is
--- not part of the attune signature -- it never applies there); the Resist panel
--- declares its own (per element + scope) via panel.dataSig.
+-- part of BOTH signatures -- in attune mode it is the attunement threshold);
+-- the Resist panel declares its own (per element + scope) via panel.dataSig.
 local function PanelSig(panel)
     if panel.dataSig then
         return panel.dataSig(panel)
     end
     if PanelMode(panel) == "attune" then
         return "attune:" .. UI.filters.scope
+            .. ":" .. (UI.filters.forge or "none")
             .. ":" .. (CurrentBindFilter() or "any")
     end
     return "zone:" .. UI.filters.scope
@@ -1486,8 +1513,9 @@ function UI.Build()
         prev = b; gx = 2
     end
 
-    -- Filter bar row 2: Forge (item-level; affix mode only) + Bind (multi,
-    -- item-level -> rescan)
+    -- Filter bar row 2: Forge (item-level; the affix threshold in affix mode,
+    -- the attunement threshold in attune mode) + Bind (multi, item-level ->
+    -- rescan)
     local forgeLabel = MakeText(f, "OVERLAY", "GameFontNormalSmall")
     forgeLabel:SetPoint("TOPLEFT", PAD, -70)
     forgeLabel:SetText("Forge:")
@@ -1859,15 +1887,15 @@ function UI.UpdateFilterControlState()
     if not UI.forgeSeg then return end
     local panel = PANELS[UI.activePanelIndex]
     local itemFiltersApply = not (panel and panel.ignoresItemFilters)
-    -- Forge only matters in affix mode (a forged attune also attunes base, so
-    -- it cannot change what counts as a new attunable).
-    local forgeApplies = itemFiltersApply and PanelMode(panel) ~= "attune"
+    -- Forge applies in both find modes: the affix threshold in affix mode,
+    -- the attunement threshold ("not yet attuned at this level or higher")
+    -- in attune mode.
 
     UI.modeSeg:SetEnabled(itemFiltersApply)
     setLabelEnabled(UI.findLabel, itemFiltersApply)
-    UI.forgeSeg:SetEnabled(forgeApplies)
+    UI.forgeSeg:SetEnabled(itemFiltersApply)
     UI.bindSeg:SetEnabled(itemFiltersApply)
-    setLabelEnabled(UI.forgeLabel, forgeApplies)
+    setLabelEnabled(UI.forgeLabel, itemFiltersApply)
     setLabelEnabled(UI.bindLabel, itemFiltersApply)
 
     -- The Instances tab is dungeons+raids by definition: World is locked out
@@ -2052,13 +2080,13 @@ function UI.RequestData()
     end
 
     -- A panel may declare its own data source (Resist -> ComputeResistData);
-    -- otherwise the shared panels read the mode's slice: scope/forge/bind
-    -- ComputeZoneData in affix mode, scope/bind ComputeAttuneData in attune
-    -- mode (forge never applies there).
+    -- otherwise the shared panels read the mode's slice (scope/forge/bind):
+    -- ComputeZoneData in affix mode, ComputeAttuneData in attune mode (where
+    -- forge is the attunement threshold).
     if panel.fetch then
         panel.fetch(panel, handle)
     elseif PanelMode(panel) == "attune" then
-        AF.ComputeAttuneData(UI.filters.scope, CurrentBindFilter(), handle)
+        AF.ComputeAttuneData(UI.filters.scope, CurrentForgeFilter(), CurrentBindFilter(), handle)
     else
         AF.ComputeZoneData(UI.filters.scope, CurrentForgeFilter(), CurrentBindFilter(), handle)
     end

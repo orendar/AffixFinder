@@ -109,7 +109,7 @@ local INSTANCES = {
             "Upper Blackrock Spire", "Dire Maul", "Stratholme", "Scholomance",
         },
         raid = {
-            "Molten Core", "Onyxia's Lair", "Blackwing Lair", "Zul'Gurub",
+            "Molten Core", "Blackwing Lair", "Zul'Gurub",
             "Ruins of Ahn'Qiraj", "Temple of Ahn'Qiraj", "Ahn'Qiraj",
             "Ahn'Qiraj Temple", "Ahn'Qiraj Ruins",  -- server's word order
         },
@@ -140,7 +140,8 @@ local INSTANCES = {
             "The Forge of Souls", "Pit of Saron", "Halls of Reflection",
         },
         raid = {
-            "Naxxramas", "The Obsidian Sanctum", "The Eye of Eternity",
+            "Naxxramas", "Onyxia's Lair",  -- 3.3.5 has the level-80 revamp, not the classic raid
+            "The Obsidian Sanctum", "The Eye of Eternity",
             "Vault of Archavon", "Ulduar", "Trial of the Crusader",
             "Icecrown Citadel", "The Ruby Sanctum",
         },
@@ -180,12 +181,15 @@ end
 -- GetLFGDungeonInfo expansionLevel -> our expansion key.
 local LFG_EXPANSION = { [0] = "classic", [1] = "tbc", [2] = "wotlk" }
 
--- Expansion for a bundled warp-zone index (see WARP_ZONE_INDEX). TBC: Quel'Danas
--- /Eversong/Ghostlands (0-2), Silvermoon (28), Draenei isles + Exodar (50-52),
--- Outland (53-60). WotLK: all Northrend (61-71). Everything else is classic.
+-- Expansion for a bundled warp-zone index (see WARP_ZONE_INDEX). TBC: Isle of
+-- Quel'Danas (0, level-70 daily content) and Outland (53-60). WotLK: all
+-- Northrend (61-71). Everything else is classic -- deliberately INCLUDING the
+-- Blood Elf / Draenei starting zones (Eversong, Ghostlands, Silvermoon,
+-- Azuremyst, Bloodmyst, Exodar; indices 1-2, 28, 50-52): the expansion filter
+-- is a level-bracket filter for farming, and those are 1-20 content, so users
+-- expect them under Classic with the other starting zones.
 local TBC_WARP_INDICES = {
-    [0] = true, [1] = true, [2] = true, [28] = true,
-    [50] = true, [51] = true, [52] = true, [53] = true, [54] = true,
+    [0] = true, [53] = true, [54] = true,
     [55] = true, [56] = true, [57] = true, [58] = true, [59] = true, [60] = true,
 }
 local function warpZoneExpansion(index)

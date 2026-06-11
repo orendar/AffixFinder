@@ -730,8 +730,8 @@ local function getCreatureSources(itemId)
         -- 9th return: the source's zone ID. Instance interiors carry bit
         -- 0x8000 (id - 32768 = the instance map id, e.g. Deadmines = 32804 =
         -- 0x8000 + map 36); the open-world section sharing an instance's name
-        -- has a plain AreaTable id (The Deadmines entrance = 1581). See
-        -- synastria_api.md; confirmed in-game via /af srcdbg.
+        -- has a plain AreaTable id (The Deadmines entrance = 1581).
+        -- Confirmed in-game via /af srcdbg.
         local ok, srcType, srcObjType, srcObjId, chance, dropsPerThousand, objName, zoneName, spawnedCount, srcZoneId =
             safeCall(ItemLocGetSourceAt, itemId, sourceIndex)
         zoneName = ok and trim(zoneName) or ""
@@ -813,6 +813,32 @@ local function itemMatchesBind(itemId, bindFilter)
     return not bop
 end
 
+-- The bind and mythic gates together, on ONE GetItemTagsCustom read (bind is
+-- the 2nd return's bit 0x80, mythic the 1st return's) -- the scan hot loops
+-- run both per item, so paying one API call instead of two matters there.
+-- Same per-gate semantics as itemMatchesBind/itemIsMythic: a failed read
+-- means "not BoP" (bind "bop" fails, "boe" passes) and "not mythic" (kept).
+local function itemPassesTagFilters(itemId, bindFilter, includeMythics)
+    if not bindFilter and includeMythics then
+        return true  -- nothing to check; skip the API call entirely
+    end
+    local ok, tags1, tags2 = safeCall(GetItemTagsCustom, itemId)
+    if not ok then
+        tags1, tags2 = 0, 0
+    end
+    if not includeMythics and bitAnd(tags1 or 0, 0x80) ~= 0 then
+        return false
+    end
+    if bindFilter then
+        local bop = bitAnd(tags2 or 0, 0x80) ~= 0
+        if bindFilter == "bop" then
+            return bop
+        end
+        return not bop
+    end
+    return true
+end
+
 -- Computes an affixed item's value for a scope/forge/bind, or nil if it does
 -- not count. Shared by every aggregation pass. includeMythics false drops mythic
 -- items entirely (so they never reach the zone/mob totals).
@@ -820,10 +846,7 @@ local function affixedItemValue(itemId, scope, forgeFilter, bindFilter, includeM
     if not itemMatchesScope(itemId, scope) then
         return nil
     end
-    if not itemMatchesBind(itemId, bindFilter) then
-        return nil
-    end
-    if not includeMythics and itemIsMythic(itemId) then
+    if not itemPassesTagFilters(itemId, bindFilter, includeMythics) then
         return nil
     end
     -- One GetItemInfoCustom call feeds the melee-weapon exclusion, display
@@ -1333,6 +1356,30 @@ local function scopeForgeKey(scope, forgeFilter, bindFilter, includeMythics)
         .. ":" .. (includeMythics and "myth" or "nomyth")
 end
 
+-- Folds one item's source rows into a kill tally: kills[zoneName][npcId] =
+-- max reported spawns (0-spawn rows -- summons/scripted spawns -- are not
+-- real clear kills and stay out of the denominator), and zoneIds[zoneName] =
+-- first-seen source zone id. Shared by the affix and attune scans' tally
+-- passes (see AF.killTallies in AffixFinder.lua).
+local function foldSourcesIntoTally(sources, kills, zoneIds)
+    for s = 1, #sources do
+        local src = sources[s]
+        if src.zoneId and not zoneIds[src.zoneName] then
+            zoneIds[src.zoneName] = src.zoneId
+        end
+        if (src.spawnedCount or 0) > 0 then
+            local zoneKills = kills[src.zoneName]
+            if not zoneKills then
+                zoneKills = {}
+                kills[src.zoneName] = zoneKills
+            end
+            if (zoneKills[src.npcId] or 0) < src.spawnedCount then
+                zoneKills[src.npcId] = src.spawnedCount
+            end
+        end
+    end
+end
+
 -- Produces (and caches in memory) the aggregated data for a scope/forge/bind:
 -- the per-zone affix totals and the per-mob expected value. All zone/EV/current
 -- views format from this; only the source graph is transient. Async: calls
@@ -1357,12 +1404,18 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
         -- max reported spawns, over EVERY affixed item's killable sources --
         -- including items the value gate drops (melee weapons, fully-attuned,
         -- bind/mythic-filtered): their droppers still die in a full clear, so
-        -- "kills per clear" wants them. Ints only; in-memory like the rest.
-        local killsByZoneNpc = {}
-        -- zoneName -> source zone ID (first seen). Bit 0x8000 marks an
-        -- instance INTERIOR; the Instances view uses it to drop the open-world
-        -- section that shares an instance's name (Deadmines entrance problem).
-        local zoneIdsByName = {}
+        -- "kills per clear" wants them. zoneIdsByName: zoneName -> source zone
+        -- ID (first seen; bit 0x8000 marks an instance INTERIOR -- the
+        -- Instances view uses it to drop the open-world section that shares an
+        -- instance's name, the Deadmines entrance problem). Both depend ONLY
+        -- on the candidate id list, so they are built once per list and shared
+        -- through AF.killTallies: on a cache hit ("not building") the value
+        -- gate runs FIRST and gated-out items skip their source walk -- the
+        -- scan's dominant cost (1 + #rows API calls per item).
+        local tallyCached = AF.killTallies.affix
+        local building = not (tallyCached and tallyCached.ids == ids)
+        local killsByZoneNpc = building and {} or tallyCached.kills
+        local zoneIdsByName = building and {} or tallyCached.zoneIds
         -- Central per-item record (in-memory aggregate, like mobsByKey -- never
         -- persisted). One entry per affixed item that still has affixes left and
         -- a killable source; the Items panel and per-item views read it without a
@@ -1385,29 +1438,31 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
 
         runChunked(#ids, function(i)
             local itemId = ids[i]
-            -- Sources come before the value gate so the kill tally sees every
-            -- affixed item's droppers, not just the gated ones.
-            local sources = getCreatureSources(itemId)
-            for s = 1, #sources do
-                local src = sources[s]
-                if src.zoneId and not zoneIdsByName[src.zoneName] then
-                    zoneIdsByName[src.zoneName] = src.zoneId
-                end
-                -- 0-spawn rows (summons/scripted spawns) are not real clear
-                -- kills; keep them out of the denominator.
-                if (src.spawnedCount or 0) > 0 then
-                    local zoneKills = killsByZoneNpc[src.zoneName]
-                    if not zoneKills then
-                        zoneKills = {}
-                        killsByZoneNpc[src.zoneName] = zoneKills
-                    end
-                    if (zoneKills[src.npcId] or 0) < src.spawnedCount then
-                        zoneKills[src.npcId] = src.spawnedCount
-                    end
-                end
+            local sources
+            if building then
+                -- Tally pass: sources come before the value gate so the kill
+                -- tally sees every affixed item's droppers, not just the
+                -- gated ones.
+                sources = getCreatureSources(itemId)
+                foldSourcesIntoTally(sources, killsByZoneNpc, zoneIdsByName)
             end
             local value = affixedItemValue(itemId, scope, forgeFilter, bindFilter, includeMythics, perClass)
-            if not value or #sources == 0 then
+            if not value then
+                return
+            end
+            -- An item with no affixes left that is also not whole-item
+            -- unattuned contributes to NOTHING any view reads (it only ever
+            -- fed the zone rows' candidateItems, which nothing displays), so
+            -- stop here -- on cached-tally passes this also skips its source
+            -- walk, the dominant win on developed accounts where most affixed
+            -- items are in this state.
+            if value.affixesLeft <= 0 and not value.unattuned then
+                return
+            end
+            if not sources then
+                sources = getCreatureSources(itemId)
+            end
+            if #sources == 0 then
                 return
             end
             affixedItemsScanned = affixedItemsScanned + 1
@@ -1526,6 +1581,13 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
                 end
             end
         end, function()
+            if building then
+                AF.killTallies.affix = {
+                    ids = ids,
+                    kills = killsByZoneNpc,
+                    zoneIds = zoneIdsByName,
+                }
+            end
             finish({
                 scope = scope,
                 forgeFilter = forgeFilter,
@@ -2176,6 +2238,7 @@ I.Scan = {
     EV_MODE_LABELS = EV_MODE_LABELS,
     filterCaption = filterCaption,
     findZoneRow = findZoneRow,
+    foldSourcesIntoTally = foldSourcesIntoTally,
     getAffixCounts = getAffixCounts,
     getAffixMasks = getAffixMasks,
     getCreatureSources = getCreatureSources,
@@ -2189,6 +2252,7 @@ I.Scan = {
     isIgnoredMeleeWeaponId = isIgnoredMeleeWeaponId,
     itemHasRandomAffix = itemHasRandomAffix,
     itemIsMythic = itemIsMythic,
+    itemPassesTagFilters = itemPassesTagFilters,
     itemIsUnattuned = itemIsUnattuned,
     itemMatchesBind = itemMatchesBind,
     itemMatchesScope = itemMatchesScope,

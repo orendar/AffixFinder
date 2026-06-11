@@ -4,11 +4,13 @@
 -- auction house, loot, quest rewards, chat links, LootDB): how many affixes are still
 -- left to attune on the item, and -- when any remain -- the best killable source
 -- and the suffixes still needed. Items with no affix line of their own (non-
--- affixed attunables, melee weapons) get the whole-item view instead: attuned,
--- or "not attuned yet" plus the best source -- the items the New-items mode
--- hunts. This is what makes the addon ambient: you no longer have to open the
--- window to know whether an item in front of you is worth attuning and where
--- it drops.
+-- affixed attunables, melee weapons) get a single farm line instead -- the
+-- items the New-items mode hunts -- and ONLY while unattuned with a known
+-- killable source: the game's own tooltip already shows whether an item is
+-- attuned, so AffixFinder adds just the one thing it can't, where to farm it
+-- (the part that matters for chat links and the AH). This is what makes the
+-- addon ambient: you no longer have to open the window to know whether an
+-- item in front of you is worth attuning and where it drops.
 --
 -- Everything is computed ON DEMAND via AF.GetItemAffixInfo /
 -- GetRemainingAffixNames / GetItemAttuneStatus (the same gates the scans use,
@@ -96,21 +98,19 @@ local function addAffixLines(tooltip, link)
         if left > 0 and info.bestSource then
             addBestSourceLine(tooltip, info.bestSource)
         end
-    elseif status then
+    elseif status and status.unattuned and status.bestSource then
         -- No affix line of its own (non-affixed attunable, or a melee weapon
-        -- whose affixes never count): the whole-item state is the story.
-        if status.unattuned then
-            tooltip:AddLine(string.format("%sAffixFinder|r: %snot attuned yet|r",
-                PREFIX_COLOR, LEFT_COLOR))
-            if status.bestSource then
-                addBestSourceLine(tooltip, status.bestSource)
-            end
-        else
-            tooltip:AddLine(string.format("%sAffixFinder|r: %sattuned|r",
-                PREFIX_COLOR, DONE_COLOR))
-        end
+        -- whose affixes never count). The game's tooltip already says whether
+        -- the item is attuned, so no attuned/not-attuned echo: one farm line,
+        -- only while there is somewhere to farm.
+        local s = status.bestSource
+        tooltip:AddLine(string.format("%sAffixFinder|r: farm %s -- %s (%d spawns)",
+            PREFIX_COLOR, tostring(s.zoneName or "?"), tostring(s.npcName or "?"),
+            tonumber(s.spawnedCount) or 0))
     else
-        return  -- not attunable at all, or the custom APIs are not ready yet
+        -- Not attunable at all, the custom APIs are not ready yet, or a
+        -- whole-item attunable with nothing to add (attuned / no source).
+        return
     end
 
     tooltip:Show()  -- re-fit the tooltip after adding the AffixFinder lines

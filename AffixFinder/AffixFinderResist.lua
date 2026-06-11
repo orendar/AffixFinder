@@ -13,7 +13,6 @@ local computeWithCache = Scan.computeWithCache
 local ensureAffixedIds = Scan.ensureAffixedIds
 local getCreatureSources = Scan.getCreatureSources
 local isIgnoredMeleeWeaponId = Scan.isIgnoredMeleeWeaponId
-local itemIsMythic = Scan.itemIsMythic
 local itemMatchesScope = Scan.itemMatchesScope
 local makeProgress = Scan.makeProgress
 local newZoneRow = Scan.newZoneRow
@@ -158,18 +157,20 @@ local function affixedResistValue(itemId, scope, elementIndex, includeMythics)
     if not itemMatchesScope(itemId, scope) then
         return nil
     end
-    -- Honour the mythic setting for consistency with the affix views. (In
-    -- practice mythic items drop only from mythic dungeons and aren't expected
-    -- to carry resist affixes, so this rarely changes the ranking -- but the
-    -- behaviour should match the rest of the addon rather than silently differ.)
-    if not includeMythics and itemIsMythic(itemId) then
-        return nil
-    end
     if isIgnoredMeleeWeaponId(itemId) then
         return nil
     end
-    local tok, _, tags2 = safeCall(GetItemTagsCustom, itemId)
+    -- One GetItemTagsCustom read covers both tag gates: can-roll-resist (2nd
+    -- return's bit 0x2) and the mythic setting (1st return's bit 0x80). The
+    -- mythic gate exists for consistency with the affix views -- in practice
+    -- mythic items drop only from mythic dungeons and aren't expected to carry
+    -- resist affixes, so it rarely changes the ranking, but the behaviour
+    -- should match the rest of the addon rather than silently differ.
+    local tok, tags1, tags2 = safeCall(GetItemTagsCustom, itemId)
     if not tok or bitAnd(tags2 or 0, 0x2) == 0 then
+        return nil
+    end
+    if not includeMythics and bitAnd(tags1 or 0, 0x80) ~= 0 then
         return nil
     end
     local mok, p1, p2, a1, a2 = safeCall(GetItemAffixMask, itemId)

@@ -48,6 +48,17 @@ AF.attunableItemIds = nil
 AF.attunableItemIdsLevel = nil
 AF.attuneData = {}
 
+-- Kill-denominator tallies (killsByZoneNpc + zoneIdsByName), cached per
+-- candidate-id list (keys: "affix", "attune") and shared by every slice built
+-- from that list. They depend ONLY on static source data -- never on
+-- attunement progress or the item-level filters -- so ClearDynamicData leaves
+-- them alone and reusing them lets later scans skip the source walk for items
+-- the value gate drops (the scan's dominant cost). Each entry is
+-- { ids, kills, zoneIds }, validated by the id table's IDENTITY: a
+-- rediscovery (level-up, ClearAll) makes a new table and the stale tally
+-- simply stops matching. In-memory only, never persisted.
+AF.killTallies = {}
+
 -- ---------------------------------------------------------------------------
 -- Configuration (persisted in SavedVariables by AffixFinderConfig.lua). Only a
 -- few scalars are stored -- never the item graph or source data -- so this has
@@ -150,6 +161,7 @@ function AF.ClearAll()
     AF.attunableItemIds = nil
     AF.attunableItemIdsLevel = nil
     AF.attuneData = {}
+    AF.killTallies = {}
     if type(_G.AffixFinderDB) == "table" then
         _G.AffixFinderDB.affixCache = nil
         _G.AffixFinderDB.attunableCache = nil

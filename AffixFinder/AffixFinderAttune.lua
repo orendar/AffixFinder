@@ -11,13 +11,13 @@ local addBreakdownCount = Scan.addBreakdownCount
 local bestCreatureSource = Scan.bestCreatureSource
 local computeWithCache = Scan.computeWithCache
 local ensureAttunableIds = Scan.ensureAttunableIds
+local foldSourcesIntoTally = Scan.foldSourcesIntoTally
 local getCreatureSources = Scan.getCreatureSources
 local getItemCategory = Scan.getItemCategory
 local getItemClasses = Scan.getItemClasses
-local itemIsMythic = Scan.itemIsMythic
 local itemIsUnattuned = Scan.itemIsUnattuned
-local itemMatchesBind = Scan.itemMatchesBind
 local itemMatchesScope = Scan.itemMatchesScope
+local itemPassesTagFilters = Scan.itemPassesTagFilters
 local makeProgress = Scan.makeProgress
 local newClassZoneTally = Scan.newClassZoneTally
 local newZoneRow = Scan.newZoneRow
@@ -35,8 +35,14 @@ local scopeForgeKey = Scan.scopeForgeKey
 -- is worth exactly one new attune, so valuePerDrop is 1 and a mob's evPerKill
 -- is simply the sum of its qualifying items' drop chances.
 --
--- Forge does not apply (any forged attune also attunes base, and itemIsUnattuned
--- at the base filter already honours that via HasAttunedAnyVariantOfItem).
+-- Forge is an optional threshold on what "unattuned" means: the base filter
+-- keeps the game's binary sense (no variant ever attuned -- a forged attune
+-- also attunes base, and itemIsUnattuned at the base filter honours that via
+-- HasAttunedAnyVariantOfItem), while TF+/WF+/LF narrow it to items not yet
+-- attuned AT any included forge level (itemIsUnattuned's threshold semantics
+-- -- attunement is account-wide at every level, like the rest of the system).
+-- A forged target only lands on the drops that ROLL forged, so evPerKill is
+-- weighted by AF.GetForgeDropChance, exactly like the affix scan's EV.
 --
 -- MELEE WEAPONS COUNT here, unlike every affix gate: the melee exclusion exists
 -- because melee RANDOM AFFIXES grant no attuned stats, but attuning the weapon
@@ -51,19 +57,17 @@ local scopeForgeKey = Scan.scopeForgeKey
 
 -- Per-item slice for new-attunables mode, or nil if the item does not count:
 -- it must match the scope and bind filters, pass the mythic setting, and be
--- unattuned in the game's binary sense (no variant ever attuned). No melee
--- exclusion and no affix logic -- see the header.
-local function newAttunableValue(itemId, scope, bindFilter, includeMythics, wantClasses)
+-- unattuned under the forge threshold (base filter = the game's binary sense:
+-- no variant ever attuned). No melee exclusion and no affix logic -- see the
+-- header.
+local function newAttunableValue(itemId, scope, forgeFilter, bindFilter, includeMythics, wantClasses)
     if not itemMatchesScope(itemId, scope) then
         return nil
     end
-    if not itemMatchesBind(itemId, bindFilter) then
+    if not itemPassesTagFilters(itemId, bindFilter, includeMythics) then
         return nil
     end
-    if not includeMythics and itemIsMythic(itemId) then
-        return nil
-    end
-    if not itemIsUnattuned(itemId) then
+    if not itemIsUnattuned(itemId, forgeFilter) then
         return nil
     end
     local reqLevel, itemType, itemSubType, itemEquipLoc
@@ -82,17 +86,16 @@ end
 -- Builds (and memory-caches in AF.attuneData) the per-zone/per-mob data for
 -- new attunables, producing the SAME slice shape as AF.ComputeZoneData so
 -- AF.BuildZoneEV / AF.BuildMobList / AF.BuildInstanceRankings format it
--- unchanged. Per mob, evPerKill is the expected NEW ITEM ATTUNES per kill;
--- itemsDropped/affixesLeft both count the qualifying (unattuned) items, since
--- each is worth exactly one attune. Async: onComplete(data) or
--- onComplete(nil, errorText). bindFilter is "bop", "boe", or nil (both).
-function AF.ComputeAttuneData(scope, bindFilter, onComplete)
+-- unchanged. Per mob, evPerKill is the expected NEW ITEM ATTUNES per kill
+-- (forge-rarity-weighted under a forged threshold); itemsDropped/affixesLeft
+-- both count the qualifying (unattuned) items, since each is worth exactly
+-- one attune. Async: onComplete(data) or onComplete(nil, errorText).
+-- forgeFilter is an AF.FORGE_FLAGS entry or nil (base); bindFilter is "bop",
+-- "boe", or nil (both).
+function AF.ComputeAttuneData(scope, forgeFilter, bindFilter, onComplete)
     onComplete = onComplete or function() end
     local includeMythics = AF.GetConfig("includeMythics") and true or false
-    -- Forge never applies in this mode; nil yields the shared key's "0" slot
-    -- (AF.attuneData is its own store, so there is no collision to avoid --
-    -- this just keeps one key format across the compute functions).
-    local key = scopeForgeKey(scope, nil, bindFilter, includeMythics)
+    local key = scopeForgeKey(scope, forgeFilter, bindFilter, includeMythics)
 
     computeWithCache(AF.attuneData, key, function(finish)
     ensureAttunableIds(function(ids, err)
@@ -106,41 +109,48 @@ function AF.ComputeAttuneData(scope, bindFilter, onComplete)
         local mobsByKey = {}
         -- Kill-denominator tally for the Instances builder: every attunable
         -- item's killable droppers, gated or not (they still die in a clear).
-        -- Same shape and rules as ComputeZoneData's (ints only, in-memory).
-        local killsByZoneNpc = {}
-        local zoneIdsByName = {}
+        -- Like ComputeZoneData's, it depends ONLY on the candidate id list,
+        -- so it is built once per list and shared through AF.killTallies; on
+        -- a cache hit the value gate runs FIRST and attuned/filtered items
+        -- skip their source walk -- on developed accounts most attunable
+        -- items are already attuned, so this is most of the scan.
+        local tallyCached = AF.killTallies.attune
+        local building = not (tallyCached and tallyCached.ids == ids)
+        local killsByZoneNpc = building and {} or tallyCached.kills
+        local zoneIdsByName = building and {} or tallyCached.zoneIds
         local itemsById = {}
         local itemsScanned = 0
         local progress = makeProgress("new-attunable sources")
         local perClass = (scope == "account")
+        -- Forge rarity (EV only, never counts): under a forged threshold an
+        -- attune only lands on the drops that roll AT an included forge
+        -- level. Snapshot per scan, exactly like ComputeZoneData; the base
+        -- filter's chance is 1, so the binary mode's EV is unchanged.
+        local forgePower = AF.GetForgePower()
+        local forgeDropChance = AF.GetForgeDropChance(forgeFilter, forgePower)
 
         runChunked(#ids, function(i)
             local itemId = ids[i]
-            -- Sources come before the value gate so the kill tally sees every
-            -- attunable item's droppers, not just the unattuned ones.
-            local sources = getCreatureSources(itemId)
-            for s = 1, #sources do
-                local src = sources[s]
-                if src.zoneId and not zoneIdsByName[src.zoneName] then
-                    zoneIdsByName[src.zoneName] = src.zoneId
-                end
-                if (src.spawnedCount or 0) > 0 then
-                    local zoneKills = killsByZoneNpc[src.zoneName]
-                    if not zoneKills then
-                        zoneKills = {}
-                        killsByZoneNpc[src.zoneName] = zoneKills
-                    end
-                    if (zoneKills[src.npcId] or 0) < src.spawnedCount then
-                        zoneKills[src.npcId] = src.spawnedCount
-                    end
+            local sources
+            if building then
+                -- Tally pass: sources come before the value gate so the kill
+                -- tally sees every attunable item's droppers, not just the
+                -- unattuned ones.
+                sources = getCreatureSources(itemId)
+                foldSourcesIntoTally(sources, killsByZoneNpc, zoneIdsByName)
+                if #sources == 0 then
+                    return
                 end
             end
-            if #sources == 0 then
-                return
-            end
-            local value = newAttunableValue(itemId, scope, bindFilter, includeMythics, perClass)
+            local value = newAttunableValue(itemId, scope, forgeFilter, bindFilter, includeMythics, perClass)
             if not value then
                 return
+            end
+            if not sources then
+                sources = getCreatureSources(itemId)
+                if #sources == 0 then
+                    return
+                end
             end
             itemsScanned = itemsScanned + 1
 
@@ -220,8 +230,9 @@ function AF.ComputeAttuneData(scope, bindFilter, onComplete)
                     mobsByKey[mobKey] = mob
                 end
                 -- valuePerDrop is 1 (one new attune per drop), so the EV delta
-                -- is the drop chance itself.
-                local evDelta = src.dropProbability
+                -- is the drop chance, weighted by how rarely a drop rolls at
+                -- the threshold's forge levels (1 for the base filter).
+                local evDelta = src.dropProbability * forgeDropChance
                 mob.evPerKill = mob.evPerKill + evDelta
                 mob.itemsDropped = mob.itemsDropped + 1
                 mob.affixesLeft = mob.affixesLeft + 1
@@ -244,11 +255,21 @@ function AF.ComputeAttuneData(scope, bindFilter, onComplete)
                 end
             end
         end, function()
+            if building then
+                AF.killTallies.attune = {
+                    ids = ids,
+                    kills = killsByZoneNpc,
+                    zoneIds = zoneIdsByName,
+                }
+            end
             finish({
                 mode = "attune",
                 scope = scope,
+                forgeFilter = forgeFilter,
                 bindFilter = bindFilter,
                 includeMythics = includeMythics,
+                forgePower = forgePower,
+                forgeDropChance = forgeDropChance,
                 rows = rows,
                 rowsByZone = rowsByZone,
                 mobsByKey = mobsByKey,

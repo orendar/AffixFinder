@@ -131,13 +131,22 @@ local function printZoneExpectedValue(options)
     end)
 end
 
+-- The attune captions' forge note: silent at the base threshold ("new
+-- attunables" already means never attuned), the threshold label otherwise.
+local function attuneForgeNote(forgeFilter)
+    if forgeFilter and (tonumber(forgeFilter.minLevel) or 0) > 0 then
+        return ", " .. tostring(forgeFilter.label)
+    end
+    return ""
+end
+
 -- Ranks full dungeon/raid clears (the UI's Instances tab, in chat form):
 -- expected affixes per clear and per 1000 kills of affix-dropping mobs.
 -- Sorted by density like the tab's default sort; shares the scope/forge/bind
 -- and limit semantics of /af zones. With options.attune ("/af attune
 -- instances") the value model is NEW item attunes instead -- the slice comes
--- from ComputeAttuneData (forge never applies there; bind does) and the kill
--- denominator counts attunable-dropping mobs.
+-- from ComputeAttuneData (forge is the attunement threshold there; bind
+-- applies as usual) and the kill denominator counts attunable-dropping mobs.
 local function printInstanceRankings(options)
     local scope = options.scope or AF.defaultScope or "character"
     local forgeFilter = options.forgeFilter
@@ -158,6 +167,7 @@ local function printInstanceRankings(options)
         if attune then
             local bindLabel = AF.BindLabel(options.bindFilter)
             chat("Top instances by full-clear new item attunes (" .. scope
+                .. attuneForgeNote(forgeFilter)
                 .. (bindLabel and (", " .. bindLabel) or "")
                 .. "; " .. #rows .. " instances; sorted by new attunes/1000 kills;"
                 .. " kills count attunable-dropping mobs)")
@@ -182,7 +192,7 @@ local function printInstanceRankings(options)
     end
 
     if attune then
-        AF.ComputeAttuneData(scope, options.bindFilter, handle)
+        AF.ComputeAttuneData(scope, forgeFilter, options.bindFilter, handle)
     else
         AF.ComputeZoneData(scope, forgeFilter, options.bindFilter, handle)
     end
@@ -252,18 +262,21 @@ local function printResistRankings(options)
 end
 
 -- Ranks zones by expected NEW item attunes per 1000 kills (items the player
--- has not attuned at all -- see AffixFinderAttune.lua), reusing the generic EV
+-- has not attuned -- see AffixFinderAttune.lua), reusing the generic EV
 -- builder over the new-attunables slice. Shares the spawn-threshold / mode /
--- limit semantics of /af zones ev. Forge never applies; bind does.
+-- limit semantics of /af zones ev. Forge is the attunement threshold ("not
+-- yet attuned at this level or higher", EV weighted by forge rarity); bind
+-- applies as usual.
 local function printAttuneRankings(options)
     local scope = options.scope or AF.defaultScope or "character"
+    local forgeFilter = options.forgeFilter
     local evMode = options.evMode or "best"
     local minSpawns = tonumber(options.minSpawns) or 1
     if minSpawns < 0 then
         minSpawns = 0
     end
 
-    AF.ComputeAttuneData(scope, options.bindFilter, function(data, err)
+    AF.ComputeAttuneData(scope, forgeFilter, options.bindFilter, function(data, err)
         if not data then
             reportScanError(err, "scan new attunables")
             return
@@ -276,11 +289,15 @@ local function printAttuneRankings(options)
         end
         local bindLabel = AF.BindLabel(options.bindFilter)
         local modeLabel = EV_MODE_LABELS[evMode] or evMode
+        local what = (forgeFilter and (tonumber(forgeFilter.minLevel) or 0) > 0)
+            and ("items you haven't attuned at " .. tostring(forgeFilter.label))
+            or "items you haven't attuned at all"
         chat("New attunables: top zones by new item attunes/1000 kills (" .. scope
+            .. attuneForgeNote(forgeFilter)
             .. (bindLabel and (", " .. bindLabel) or "")
             .. "; " .. modeLabel .. "; min spawns " .. minSpawns
             .. "; matched " .. #zones .. "/" .. zonesDiscovered
-            .. " zones; items you haven't attuned at all, affixes ignored)")
+            .. " zones; " .. what .. ", affixes ignored)")
 
         if #zones == 0 then
             chat("No qualifying mobs found (" .. mobsBelowThreshold

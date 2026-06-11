@@ -39,7 +39,7 @@ Enable **AffixFinder** at the character-select screen.
 - `/af zones ev 5` ranks zones by their best farmable mobs.
 - `/af instances` ranks full dungeon/raid clears.
 - `/af resist fire` ranks fire-resistance farms.
-- `/af attune` ranks farms for items you haven't attuned at all yet.
+- `/af attune` ranks farms for items you haven't attuned at all yet (`/af attune tf` - not yet attuned at Titanforged or higher).
 - `/af attune instances` ranks full clears by new item attunes.
 - `/af config` opens settings.
 - `/af help` lists commands.
@@ -51,7 +51,7 @@ The first scan can take a little while. Later scans are much faster because Affi
 The **Find** control at the top picks what every tab counts:
 
 - **Affixes** (default) - remaining random affixes, the classic AffixFinder model.
-- **New items** - items you have not attuned *at all* yet: non-affixed items never attuned, plus affixed items with zero affixes attuned. Every unattuned item is worth exactly one new attune - affix multiplicity is deliberately ignored. Forge is greyed out in this mode (a forged attune also attunes base, so it cannot change what counts); Bind and Class still apply.
+- **New items** - items you have not attuned yet. With Forge at **None** that is the game's binary sense: non-affixed items never attuned, plus affixed items with zero affixes attuned. A forge filter (**TF+**/**WF+**/**LF**) narrows it to items you have not attuned *at that forge level or higher* - for example, TF+ finds farms for titanforged attunes you are still missing. Every qualifying item is worth exactly one new attune - affix multiplicity is deliberately ignored - and under a forge filter the per-kill numbers are weighted by how rarely a drop rolls forged, just like the Affixes mode. Bind and Class apply as usual.
 
 The tabs are views over whichever model is selected:
 
@@ -68,7 +68,7 @@ Clicking a mob (or an item's best-mob) row marks that mob on the map. Questie is
 
 ### Tooltips
 
-AffixFinder also adds a line to item tooltips everywhere in the game (bags, bank, auction house, loot, quest rewards, chat links, LootDB): how many affixes are still left to attune on the item and, when any remain, the best killable source and the suffixes you still need. Attunable items without an affix line of their own (non-affixed items, melee weapons) get the whole-item view instead: *not attuned yet* plus the best source, or a grey *attuned*. No window required.
+AffixFinder also adds a line to item tooltips everywhere in the game (bags, bank, auction house, loot, quest rewards, chat links, LootDB): how many affixes are still left to attune on the item and, when any remain, the best killable source and the suffixes you still need. Attunable items without an affix line of their own (non-affixed items, melee weapons) get a single farm line instead - *AffixFinder: farm Zone -- Mob (spawns)* - shown only while the item is unattuned and has a known killable source. The game's own tooltip already tells you whether an item is attuned, so AffixFinder only adds the part it can't: where to farm it, which is exactly what you want when someone links an item in chat or you spot one on the AH. No window required.
 
 ## Settings
 
@@ -87,12 +87,12 @@ AffixFinder does not save the full item graph or ranking results. It only persis
 
 - Scope can be **Character** or **Account**.
 - Forge filters are one-way thresholds: **None** is base only, **TF+** includes Titanforged/Warforged/Lightforged, **WF+** includes Warforged/Lightforged, and **LF** includes Lightforged only.
-- Forged attunement is cumulative downward: TF also attunes the base affix, WF also attunes TF and base, and LF also attunes WF, TF, and base. Attuning at any forge level at or above the filter's threshold satisfies it: AffixFinder unions what is *possible* across the included tiers (a suffix available at several forge levels is counted once), and counts a suffix as *remaining* only while it is unattuned at every included tier.
+- Forged attunement is cumulative downward: TF also attunes the base affix, WF also attunes TF and base, and LF also attunes WF, TF, and base. Attuning at any forge level at or above the filter's threshold therefore satisfies it: AffixFinder unions what is *possible* across the included tiers (a suffix available at several forge levels is counted once), and counts a suffix as *remaining* only while it is unattuned at every included tier.
 - Expected-value numbers (per-kill, per-1000-kills, per-clear) account for **forge rarity**: with a forged filter active, only the drops that actually roll at or above the threshold count (base rates: 5% Titanforged, 0.7% Warforged, 0.1% Lightforged). Prestiged characters' **Forge Power** is read from the server and applied as a multiplier (100% FP doubles the rates). `/af forgedbg` shows the exact rates in use. Affix *counts* (affixes left, items) are unaffected — rarity changes how long farming takes, not what exists.
 - Bind filters can include BoP, BoE, or both.
 - Melee weapons are ignored because their random affixes do not contribute attuned stats on Synastria. Ranged weapons, wands, and shields are still counted. The New items mode is the exception: it counts melee weapons, because it tracks whole-item attunes rather than affixes.
 - The New items mode's candidate list (everything someone on the account can attune) is cached across sessions like the affixed-item list, stamped with the character level it was discovered at. Attunability only grows with level, so the cache is reused at or below that level and rediscovered automatically once a character levels past it - including mid-session, the moment you level up (at the cap it is effectively permanent). When both the affix list and this list need discovering, AffixFinder fills them in a single pass. If something else unlocks new attunables (say, creating a new class), use **Rescan** / `/af clearcache`.
-- The Instances tab models a **full clear**: each mob's expected drops times its spawn count, summed over the instance. "Kills per clear" counts every mob that drops *any* affixed item (needed or not), so the per-1000-kills density divides by something close to a real clear; mobs that drop no affixed items at all are not counted. Difficulty and raid-size variants (Heroic, 10/25) fold into one row under the generic instance name, because the server splits their source data incompletely across the variant names; Mythic dungeons keep their own row (their drop pool is separate). Mobs with no recorded spawns (summons, scripted spawns) are not counted, and only mobs **inside** the instance count — the open-world area around an entrance that shares the instance's name (like the Deadmines cove in Westfall) is excluded. The Dungeon and Raid source filters work normally; World never applies. Sort raids by **Affixes/clear** — lockouts make density the wrong measure for them.
+- The Instances tab models a **full clear**: each mob's expected drops times its spawn count, summed over the instance. "Kills per clear" counts every mob that drops *any* affixed item (needed or not), so the per-1000-kills density divides by something close to a real clear; mobs that drop no affixed items at all are still not counted. Difficulty and raid-size variants (Heroic, 10/25) fold into one row under the generic instance name, because the server splits their source data incompletely across the variant names; Mythic dungeons keep their own row (their drop pool is separate). Mobs with no recorded spawns (summons, scripted spawns) are not counted, and only mobs **inside** the instance count - the open-world area around an entrance that shares the instance's name (like the Deadmines cove in Westfall) is excluded. The Dungeon and Raid source filters work normally there; World never applies. Sort raids by **Affixes/clear** - lockouts make density the wrong measure for them.
 - Resistance values are estimates based on item level, because the exact rolled suffix value is not available during scans.
 - Diagnostic commands such as `/af debug`, `/af zonedbg`, `/af warp`, and `/af forgedbg` are available if you want to inspect what the addon is reading.
 
