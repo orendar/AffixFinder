@@ -62,6 +62,40 @@ local function isSameZoneName(a, b)
     return normLookupText(a) ~= "" and normLookupText(a) == normLookupText(b)
 end
 
+-- Like isSameZoneName but ignores difficulty/size qualifiers, so the server's
+-- "Gundrak (Normal)" / "Gundrak Heroic" / "Naxxramas 25" all match Questie's
+-- plain "Gundrak" / "Naxxramas" zone. Uses ZoneClassify.normZoneKey (loaded
+-- after this file, so resolved lazily); falls back to the exact match if it is
+-- somehow unavailable.
+local function isSameZoneNameLoose(a, b)
+    local zc = I.ZoneClassify
+    local norm = type(zc) == "table" and zc.normZoneKey
+    if norm then
+        local ka = norm(a)
+        return ka ~= "" and ka == norm(b)
+    end
+    return isSameZoneName(a, b)
+end
+
+-- Area name for a Questie spawn-zone key, with a Questie fallback. The server's
+-- Custom_GetZoneName does not reliably resolve dungeon CONTAINER AreaIds (e.g.
+-- Gundrak's 4416 returns nil), but Questie's own ZoneDB dungeon table carries
+-- the name -- so density can still bridge that key to a yard-scaled map.
+local function questieAreaName(zoneDb, areaId)
+    local name = zoneNameForId(areaId)
+    if name and name ~= "" then
+        return name
+    end
+    if type(zoneDb) == "table" and type(zoneDb.GetDungeons) == "function" then
+        local dungeons = safeFirst(zoneDb.GetDungeons, zoneDb)
+        local entry = type(dungeons) == "table" and dungeons[tonumber(areaId)]
+        if type(entry) == "table" and entry[1] and entry[1] ~= "" then
+            return entry[1]
+        end
+    end
+    return name
+end
+
 local function unpackCoordinateResult(result, a, b, c)
     if type(result) == "table" then
         local x = tonumber(result.x or result[1])
@@ -214,38 +248,192 @@ local function getQuestieMobCoordinates(entry)
     return pickQuestieSpawn(getQuestieNpcSpawns(entry.npcId), entry.zoneName)
 end
 
--- ALL Questie-known spawn points for an NPC, zone-matched the same way the
--- warp pin is (exact zone-name match first, else the first zone with data, so
--- the result is never silently empty when Questie knows the NPC under a
--- variant naming). Coordinates are percent-of-zone-map (0-100), the only
--- coordinate space Questie exposes; (-1,-1) "somewhere in this dungeon"
--- placeholders are dropped. Returns nil without Questie / without data, else
--- { points = { {x, y}, ... }, zoneId, zoneName, matchedZone } -- matchedZone
--- false means the zone-name match failed and the fallback zone was used
--- (callers should say so rather than present fallback data as exact).
--- Consumed by the mobdbg pack-geometry diagnostic; same optional-enhancement
--- status as the warp pin (no Questie dependency).
-local function questieSpawnPoints(npcId, zoneName)
+-- QuestieCompat.UiMapData is keyed by uiMapId, each entry carrying the map's
+-- yard scale plus a `name`/`instance`. Build name -> {uiMapId,...} and
+-- instance -> {uiMapId,...} indexes once (the data is static) so a zone with no
+-- areaIdToUiMapId entry can still be matched to a yard-scaled map. Returns nil
+-- (without caching) until QuestieCompat is loaded, so a too-early call simply
+-- retries later.
+local uiMapIndex
+local function buildUiMapIndex()
+    if uiMapIndex then
+        return uiMapIndex
+    end
+    local compat = rawget(_G, "QuestieCompat")
+    local mapData = type(compat) == "table" and compat.UiMapData
+    if type(mapData) ~= "table" then
+        return nil
+    end
+    local byName, byInstance = {}, {}
+    local function push(index, key, uiMapId)
+        local list = index[key]
+        if not list then
+            list = {}
+            index[key] = list
+        end
+        list[#list + 1] = uiMapId
+    end
+    for uiMapId, data in pairs(mapData) do
+        uiMapId = tonumber(uiMapId)
+        if uiMapId and type(data) == "table" then
+            local k = normLookupText(data.name)
+            if k ~= "" then
+                push(byName, k, uiMapId)
+            end
+            local inst = tonumber(data.instance)
+            if inst and inst > 0 then
+                push(byInstance, inst, uiMapId)
+            end
+        end
+    end
+    uiMapIndex = { byName = byName, byInstance = byInstance }
+    return uiMapIndex
+end
+
+local function uiMapIdsByName(name)
+    local key = normLookupText(name)
+    local index = key ~= "" and buildUiMapIndex()
+    return index and index.byName[key]
+end
+
+local function uiMapIdsByInstance(instanceId)
+    instanceId = tonumber(instanceId)
+    local index = instanceId and buildUiMapIndex()
+    return index and index.byInstance[instanceId]
+end
+
+-- Usable UiMapIds for a zone, best scale first. The direct areaId -> uiMapId
+-- lookup covers open-world zones; dungeon CONTAINER AreaIds (e.g. Gundrak's
+-- 4416, the id its spawns are keyed under) have NO areaIdToUiMapId entry, so
+-- they are resolved against UiMapData -- by the server's instance map id when
+-- known, else by zone name. That is the only path giving instances a world-yard
+-- scale (the lesson Gundrak taught: Questie's GetParentZoneId maps a dungeon to
+-- its OUTDOOR parent, never to a floor, so a container-to-floor walk finds
+-- nothing).
+local function questieUiMapCandidates(zoneDb, zoneId, instanceId)
+    zoneId = tonumber(zoneId)
+    local candidates, seen = {}, {}
+    local function add(uiMapId)
+        uiMapId = tonumber(uiMapId)
+        if uiMapId and not seen[uiMapId] then
+            seen[uiMapId] = true
+            candidates[#candidates + 1] = uiMapId
+        end
+    end
+    local function addAll(list)
+        if list then
+            for _, uiMapId in ipairs(list) do
+                add(uiMapId)
+            end
+        end
+    end
+
+    if type(zoneDb) == "table" and type(zoneDb.GetUiMapIdByAreaId) == "function" then
+        add(safeFirst(zoneDb.GetUiMapIdByAreaId, zoneDb, zoneId))
+    end
+    addAll(uiMapIdsByInstance(instanceId))
+    addAll(uiMapIdsByName(questieAreaName(zoneDb, zoneId)))
+    return candidates
+end
+
+local function questieZoneInstanceId(zoneDb, zoneId)
+    local compat = rawget(_G, "QuestieCompat")
+    local mapData = type(compat) == "table" and compat.UiMapData
+    if type(mapData) ~= "table" then
+        return nil
+    end
+    for _, uiMapId in ipairs(questieUiMapCandidates(zoneDb, zoneId)) do
+        local data = mapData[uiMapId]
+        local instanceId = type(data) == "table" and tonumber(data.instance)
+        if instanceId then
+            return instanceId
+        end
+    end
+    return nil
+end
+
+-- Convert Questie's 0-100 map coordinates to world yards when its bundled map
+-- compatibility layer can do so. Farm-density grades use yards so one grade
+-- means roughly the same pull size in every zone. The raw map points remain
+-- available for diagnostics and as an ungraded fallback.
+local function questieWorldPoints(points, zoneId, zoneDb, instanceId)
+    zoneDb = zoneDb or importQuestieModule("ZoneDB")
+    local compat = rawget(_G, "QuestieCompat")
+    local hbd = type(compat) == "table" and compat.HBD
+    if type(hbd) ~= "table" or type(hbd.GetWorldCoordinatesFromZone) ~= "function" then
+        return nil
+    end
+
+    for _, uiMapId in ipairs(questieUiMapCandidates(zoneDb, zoneId, instanceId)) do
+        local world, instanceId, valid = {}, nil, true
+        for _, point in ipairs(points) do
+            local ok, x, y, instance =
+                safeCall(hbd.GetWorldCoordinatesFromZone, hbd,
+                    point[1] / 100, point[2] / 100, uiMapId)
+            if not ok or not tonumber(x) or not tonumber(y)
+                or (instanceId ~= nil and instance ~= instanceId)
+            then
+                valid = false
+                break
+            end
+            instanceId = instanceId or instance
+            world[#world + 1] = { tonumber(x), tonumber(y) }
+        end
+        if valid then
+            return world, uiMapId, instanceId
+        end
+    end
+    return nil
+end
+
+-- ALL Questie-known spawn points for an NPC, matched by source zone ID first
+-- and instance map ID / exact zone name after that. A failed match returns nil:
+-- geometry from some other zone must never receive a confident farm-density
+-- grade. Coordinates are percent-of-zone-map (0-100); (-1,-1) dungeon
+-- placeholders are dropped. When Questie's map layer supports the zone,
+-- metricPoints are world yards.
+local function questieSpawnPoints(npcId, zoneName, sourceZoneId)
     local spawns = getQuestieNpcSpawns(npcId)
     if type(spawns) ~= "table" then
         return nil
     end
 
     local wantedKey = normLookupText(zoneName)
-    local bestZoneId, bestSpawns
-    local fallbackZoneId, fallbackSpawns
+    local zoneDb = importQuestieModule("ZoneDB")
+    local bestZoneId, bestSpawns, matchedBy
     for zoneId, zoneSpawns in pairs(spawns) do
         if type(zoneSpawns) == "table" and zoneSpawns[1] then
-            fallbackZoneId = fallbackZoneId or zoneId
-            fallbackSpawns = fallbackSpawns or zoneSpawns
-            if wantedKey ~= "" and isSameZoneName(zoneNameForId(zoneId), zoneName) then
-                bestZoneId, bestSpawns = zoneId, zoneSpawns
+            if sourceZoneId ~= nil and tonumber(zoneId) == tonumber(sourceZoneId) then
+                bestZoneId, bestSpawns, matchedBy = zoneId, zoneSpawns, "zone id"
                 break
             end
         end
     end
-    local zoneId = bestZoneId or fallbackZoneId
-    local zoneSpawns = bestSpawns or fallbackSpawns
+    local sourceInstanceId = tonumber(sourceZoneId)
+    sourceInstanceId = sourceInstanceId and sourceInstanceId >= 32768
+        and (sourceInstanceId - 32768) or nil
+    if not bestSpawns and sourceInstanceId then
+        for zoneId, zoneSpawns in pairs(spawns) do
+            if type(zoneSpawns) == "table" and zoneSpawns[1]
+                and questieZoneInstanceId(zoneDb, zoneId) == sourceInstanceId
+            then
+                bestZoneId, bestSpawns, matchedBy = zoneId, zoneSpawns, "instance id"
+                break
+            end
+        end
+    end
+    if not bestSpawns and wantedKey ~= "" then
+        for zoneId, zoneSpawns in pairs(spawns) do
+            if type(zoneSpawns) == "table" and zoneSpawns[1]
+                and isSameZoneNameLoose(questieAreaName(zoneDb, zoneId), zoneName)
+            then
+                bestZoneId, bestSpawns, matchedBy = zoneId, zoneSpawns, "zone name"
+                break
+            end
+        end
+    end
+    local zoneId = bestZoneId
+    local zoneSpawns = bestSpawns
     if not zoneSpawns then
         return nil
     end
@@ -260,136 +448,160 @@ local function questieSpawnPoints(npcId, zoneName)
     if #points == 0 then
         return nil
     end
+    local worldPoints, uiMapId, instanceId =
+        questieWorldPoints(points, zoneId, zoneDb, sourceInstanceId)
     return {
         points = points,
+        metricPoints = worldPoints or points,
+        unit = worldPoints and "yards" or "map",
         zoneId = zoneId,
-        zoneName = zoneNameForId(zoneId),
-        matchedZone = bestZoneId ~= nil,
+        zoneName = questieAreaName(zoneDb, zoneId),
+        matchedZone = true,
+        matchedBy = matchedBy,
+        uiMapId = uiMapId,
+        instanceId = instanceId,
     }
 end
 
 -- ---------------------------------------------------------------------------
--- Spawn-pack density (Questie spawn points; percent-of-zone-map units)
+-- Farm density (how big a pull the spawn geometry can deliver)
 -- ---------------------------------------------------------------------------
--- THE one-value density score is walkPerKill: how much of the map one kill
--- costs in travel. It is computed twice:
---   * pack-wide -- greedy nearest-neighbor lap through EVERY point / points.
---   * camp (the headline when a campSize is given) -- the BEST subset of
---     campSize points (greedy nearest-to-set growth from every seed, route =
---     sum of join hops, MST-style). This is what a player actually farms:
---     when 10 of a mob's 30 points sit in one room, the camp score reflects
---     that room and ignores the scattered rest. Tie campSize to the caller's
---     min-spawns threshold so "dense enough" and "numerous enough" answer the
---     same question.
--- Grades (excellent/good/fair/poor) come from walkPerKill alone. NEVER grade
--- on nearest-neighbor gap alone: with many points everything has SOME close
--- neighbor, so a gap-only grade calls any numerous mob "tight" -- the Gundrak
--- Drakkari Frenzy lesson (24 points over a third of the map, 2.2% mean gap,
--- but a 78% lap = 3.3%/kill = poor, which matches how it farms). Span,
--- clusters, and gaps are supporting `shape` detail only.
+-- The headline score answers the question players actually ask: "to farm the N
+-- mobs I want (campSize = the min-spawns setting), how many AoE pulls does it
+-- take?" We find the densest spot -- the most spawns inside one pull circle of
+-- radius PULL_RADIUS -- as `pullCount`, then `pullsNeeded = ceil(N / pullCount)`
+-- (repeating that best spot, the way a camp is actually ground out as respawns
+-- refill it). The grade is RELATIVE to the player's N: 1 pull = excellent, 2 =
+-- good, 3 = fair, 4+ = poor. So a tight ZF-beetle swarm that hands you all N at
+-- once is excellent, while a scattered mob you grab two-at-a-time is poor.
+--
+-- Caveat by design: gathering N never needs more than N pulls, so a small N
+-- compresses the scale (at N=2 the worst case is 2 pulls = good). It is well
+-- spread from N~5 up; the default and the typical use are in that range.
+--
+-- The circle's center is NOT pinned to a spawn: from each seed we take a couple
+-- of mean-shift steps (recenter on the centroid of whatever is currently in the
+-- circle) so it settles where a player would actually stand -- between the mobs,
+-- not on the edge one.
+--
+-- pullCount is a COUNT, not a span: a ring/line whose members are far from EACH
+-- OTHER has few sharing any one circle and grades low, unlike a centroid-radius
+-- score that called any centered-but-spread pack "excellent". Respawn timing is
+-- excluded (the client cannot observe it) and spawns outside the best circle do
+-- not poison the result. Production grades require world-yard coordinates;
+-- percent-of-map geometry stays useful for tests/diagnostics but is not trusted
+-- by the list filter.
 --
 -- spawnGeometry(points, campSize) returns nil for no points, else { points,
 -- sampled, meanGap, maxGap, spanX, spanY, spanDiag, clusters, clusterSizes
--- (desc), largestClusterSpan, routeLen, walkPerKill, grade, shape,
--- camp = { size, routeLen, walkPerKill, grade } | nil (campSize < 2) }.
+-- (desc), largestClusterSpan, routeLen, walkPerKill, shape, unit,
+-- camp = { requested, size, pullCount, pullsNeeded, pullRadius, center, grade,
+-- short, confident } | nil (campSize < 2) }.
 --
--- CAVEATS: units are percent of the ZONE MAP, so values are comparable
--- between mobs of the same zone but only roughly across zones (5% of
--- Dustwallow is a much longer walk than 5% of Deadmines); thresholds are
--- deliberately coarse for that reason. The lap is an open path (respawns
--- refill behind you), not a closed cycle.
-local SPAWN_GAP_TIGHT = 3       -- mean gap <= this (% of map) is locally dense
-local SPAWN_GAP_MEDIUM = 7      -- mean gap <= this reads "medium"; above, "sparse"
-local SPAWN_CLUSTER_LINK = 6    -- points within this gap chain into one cluster
-local SPAWN_CAMP_SPAN = 12      -- a pack/cluster with a bounding diagonal <= this is a "camp"
-local SPAWN_GEOMETRY_CAP = 200  -- O(n^2) guard; beyond this, sample the first n
--- walkPerKill grade boundaries (% of map walked per kill on a farming lap).
-local DENSITY_EXCELLENT = 1.0
-local DENSITY_GOOD = 1.8
-local DENSITY_FAIR = 3.0        -- above this: "poor"
+-- Supporting whole-pack shape still uses the same distance unit as the input.
+local SPAWN_GAP_TIGHT = 3
+local SPAWN_GAP_MEDIUM = 7
+local SPAWN_CLUSTER_LINK = 6
+local SPAWN_CAMP_SPAN = 12
+local SPAWN_GEOMETRY_CAP = 200  -- cap supporting whole-pack shape; pull search uses all points
+-- The pull circle's radius: how far from where you stand a mob can be and still
+-- get balled into one AoE pull. Yards is the production contract; the map-%
+-- value is for unscaled diagnostics and pure geometry tests only. THE knob to
+-- retune if grades feel generous/harsh in game.
+local PULL_RADIUS_YARDS = 20
+local PULL_RADIUS_MAP = 3
+local PULL_RECENTER_STEPS = 2  -- mean-shift iterations toward the densest spot
 
 local DENSITY_RANK = { poor = 0, fair = 1, good = 2, excellent = 3 }
 -- Exposed so views can map a saved rank back to its label (0=any is the
 -- filter's "off" value, not a grade).
 AF.DENSITY_GRADE_BY_RANK = { [1] = "fair", [2] = "good", [3] = "excellent" }
 
-local function densityGrade(walkPerKill)
-    if walkPerKill <= DENSITY_EXCELLENT then
+-- Pulls (of the densest circle) to gather the requested N -> grade. 1 = all N at
+-- once, then one band per extra pull. These three boundaries are the tuning knob.
+local function pullsGrade(pullsNeeded)
+    if pullsNeeded <= 1 then
         return "excellent"
-    elseif walkPerKill <= DENSITY_GOOD then
+    elseif pullsNeeded <= 2 then
         return "good"
-    elseif walkPerKill <= DENSITY_FAIR then
+    elseif pullsNeeded <= 3 then
         return "fair"
     end
     return "poor"
 end
 
--- Best camp of k points: from every seed, grow the set by repeatedly adding
--- the point nearest to ANY member (Prim-style, O(seeds x k x m) with the
--- incremental nearest-distance array); route = sum of join hops. The minimum
--- over seeds is the densest k-subset a farmer could camp. When Questie maps
--- fewer points than requested, the camp covers what exists and is marked
--- `short` -- the grade is then about a smaller camp than asked for, and
--- displays should say so (the server's spawn count and Questie's point list
--- routinely disagree, so this is a data note, not an error).
-local function bestCamp(points, m, k, dist, maybeYield)
-    k = math.floor(tonumber(k) or 0)
-    if k < 2 or m < 2 then
-        return nil
-    end
-    local short = k > m
-    if k > m then
-        k = m
-    end
-    local bestRoute
-    for seed = 1, m do
-        maybeYield()
-        local inSet = { [seed] = true }
-        local nearestDist = {}
-        for j = 1, m do
-            if j ~= seed then
-                nearestDist[j] = dist(seed, j)
-            end
+-- Count spawns within `radius` of (cx, cy) and the centroid of those spawns
+-- (for the next mean-shift step).
+local function pullCircle(points, n, cx, cy, radius, maybeYield)
+    local r2 = radius * radius
+    local count, sumX, sumY = 0, 0, 0
+    for j = 1, n do
+        if j % 100 == 0 then
+            maybeYield()
         end
-        local route = 0
-        for _ = 2, k do
-            local bj, bd
-            for j = 1, m do
-                local d = nearestDist[j]
-                if not inSet[j] and d and (not bd or d < bd) then
-                    bj, bd = j, d
-                end
-            end
-            route = route + bd
-            inSet[bj] = true
-            for j = 1, m do
-                if not inSet[j] then
-                    local d = dist(bj, j)
-                    if d < nearestDist[j] then
-                        nearestDist[j] = d
-                    end
-                end
-            end
-        end
-        if not bestRoute or route < bestRoute then
-            bestRoute = route
+        local dx, dy = points[j][1] - cx, points[j][2] - cy
+        if dx * dx + dy * dy <= r2 then
+            count = count + 1
+            sumX = sumX + points[j][1]
+            sumY = sumY + points[j][2]
         end
     end
-    local walkPerKill = bestRoute / k
-    return { size = k, routeLen = bestRoute, walkPerKill = walkPerKill,
-             grade = densityGrade(walkPerKill), short = short or nil }
+    return count, sumX, sumY
 end
 
--- `maybeYield` (optional) is called at every coarse step of the O(n^2)
--- phases (each slice between calls is O(n), microseconds at the 200-point
--- cap). The background worker passes a function that yields its coroutine
--- when the frame budget is spent, so even ONE big mob cannot blow a frame --
--- the per-item budget check alone could not bound a single item's cost.
+-- Densest pull circle: from each spawn, mean-shift the circle toward the local
+-- centroid a few steps and keep the best count seen. O(n^2) (the recenter steps
+-- are a small constant factor), run inside the time-budgeted density coroutine.
+-- `short` (fewer mapped points than requested) leaves the result unconfident:
+-- too little Questie data to trust either way.
+local function bestPull(points, n, requested, maybeYield, unit)
+    requested = math.floor(tonumber(requested) or 0)
+    if requested < 2 or n < 1 then
+        return nil
+    end
+    local short = requested > n
+    local pullRadius = unit == "yards" and PULL_RADIUS_YARDS or PULL_RADIUS_MAP
+    local bestCount, bestCenter = 0, nil
+    for seed = 1, n do
+        maybeYield()
+        local cx, cy = points[seed][1], points[seed][2]
+        for step = 0, PULL_RECENTER_STEPS do
+            local count, sumX, sumY = pullCircle(points, n, cx, cy, pullRadius, maybeYield)
+            if count > bestCount then
+                bestCount = count
+                bestCenter = { cx, cy }
+            end
+            if step < PULL_RECENTER_STEPS and count > 0 then
+                cx, cy = sumX / count, sumY / count
+            end
+        end
+    end
+    local confident = unit == "yards" and not short
+    -- bestCount >= 1 always (a spawn counts itself), so this is finite.
+    local pullsNeeded = math.ceil(requested / bestCount)
+    return {
+        requested = requested,
+        size = n,
+        pullCount = bestCount,
+        pullsNeeded = pullsNeeded,
+        pullRadius = pullRadius,
+        center = bestCenter,
+        grade = pullsGrade(pullsNeeded),
+        short = short or nil,
+        confident = confident or nil,
+    }
+end
+
+-- `maybeYield` (optional) is called throughout the O(n^2) phases, including
+-- every 100 candidates in the all-points camp search. The background worker
+-- passes a function that yields its coroutine when the frame budget is spent,
+-- so even ONE big mob cannot blow a frame.
 -- Synchronous callers omit it.
 local function noYield() end
 
-local function spawnGeometry(points, campSize, maybeYield)
+local function spawnGeometry(points, campSize, maybeYield, unit)
     maybeYield = maybeYield or noYield
+    unit = unit == "yards" and "yards" or "map"
     local n = #(points or {})
     if n == 0 then
         return nil
@@ -398,9 +610,14 @@ local function spawnGeometry(points, campSize, maybeYield)
         return { points = 1, sampled = 1, meanGap = 0, maxGap = 0,
                  spanX = 0, spanY = 0, spanDiag = 0, clusters = 1,
                  clusterSizes = { 1 }, largestClusterSpan = 0, routeLen = 0,
-                 walkPerKill = 0, grade = "single spawn", shape = "single spawn" }
+                 walkPerKill = 0, shape = "single spawn", unit = unit,
+                 camp = bestPull(points, 1, campSize, maybeYield, unit) }
     end
     local m = math.min(n, SPAWN_GEOMETRY_CAP)
+    local gapTight = unit == "yards" and 40 or SPAWN_GAP_TIGHT
+    local gapMedium = unit == "yards" and 90 or SPAWN_GAP_MEDIUM
+    local clusterLink = unit == "yards" and 75 or SPAWN_CLUSTER_LINK
+    local campSpan = unit == "yards" and 160 or SPAWN_CAMP_SPAN
 
     local function dist(i, j)
         local dx = points[i][1] - points[j][1]
@@ -437,7 +654,7 @@ local function spawnGeometry(points, campSize, maybeYield)
     local spanX, spanY = maxX - minX, maxY - minY
     local spanDiag = math.sqrt(spanX * spanX + spanY * spanY)
 
-    -- Single-linkage clusters: chain points within SPAWN_CLUSTER_LINK.
+    -- Single-linkage clusters: chain points within the local-density threshold.
     local clusterOf = {}
     local clusterCount = 0
     local clusterSizes = {}
@@ -454,7 +671,7 @@ local function spawnGeometry(points, campSize, maybeYield)
                 stack[#stack] = nil
                 members[#members + 1] = cur
                 for j = 1, m do
-                    if not clusterOf[j] and dist(cur, j) <= SPAWN_CLUSTER_LINK then
+                    if not clusterOf[j] and dist(cur, j) <= clusterLink then
                         clusterOf[j] = clusterCount
                         stack[#stack + 1] = j
                     end
@@ -503,14 +720,14 @@ local function spawnGeometry(points, campSize, maybeYield)
 
     -- The supporting shape description.
     local shape
-    if spanDiag <= SPAWN_CAMP_SPAN then
+    if spanDiag <= campSpan then
         shape = "tight camp"
     elseif clusterCount >= 2 and clusterCount <= 3
-        and largestClusterSpan <= SPAWN_CAMP_SPAN then
+        and largestClusterSpan <= campSpan then
         shape = clusterCount .. " separate camps"
-    elseif meanGap <= SPAWN_GAP_TIGHT then
+    elseif meanGap <= gapTight then
         shape = "locally dense but spread out"
-    elseif meanGap <= SPAWN_GAP_MEDIUM then
+    elseif meanGap <= gapMedium then
         shape = "medium spread"
     else
         shape = "sparse"
@@ -524,9 +741,9 @@ local function spawnGeometry(points, campSize, maybeYield)
         largestClusterSpan = largestClusterSpan,
         routeLen = routeLen,
         walkPerKill = walkPerKill,
-        grade = densityGrade(walkPerKill),
         shape = shape,
-        camp = bestCamp(points, m, campSize, dist, maybeYield),
+        unit = unit,
+        camp = bestPull(points, n, campSize, maybeYield, unit),
     }
 end
 
@@ -534,8 +751,8 @@ end
 -- metric to the caller's min-spawns threshold. Unknown density (Questie
 -- absent / no data for the NPC) means "do not hide" -- missing data is not
 -- evidence of sparseness. Results are the spawnGeometry table plus `rank` /
--- camp `rank` (0-3 vs AF.DENSITY_GRADE_BY_RANK) and `matchedZone`. The memo
--- (AF.mobDensity) holds shared result tables keyed by npc/zone/campSize --
+-- camp `rank` (0-3 vs AF.DENSITY_GRADE_BY_RANK) when the camp is confident.
+-- The memo (AF.mobDensity) is keyed by npc/zone/sourceZoneId/campSize --
 -- small scalars, in-memory only, never persisted; spawn data is static so
 -- only ClearAll drops it (consistency, not correctness). `false` in the memo
 -- = computed and known-missing (so it is never re-queued).
@@ -547,7 +764,7 @@ end
 --                           (result|nil, stillUnknown): stillUnknown=true
 --                           means "not computed yet" (queue it), false means
 --                           the answer is final (incl. known-missing).
---   AF.RequestMobDensities -- queue {npcId, zoneName, campSize} requests for
+--   AF.RequestMobDensities -- queue {npcId, zoneName, zoneId, campSize} requests for
 --                           a time-budgeted OnUpdate worker (own frame, so it
 --                           never collides with the scans' chunker) and call
 --                           every onDone callback once the queue drains.
@@ -555,48 +772,56 @@ end
 --                           queue entries are deduped.
 AF.mobDensity = {}
 
-local function densityKey(npcId, zoneName, campSize)
-    return npcId .. ":" .. tostring(zoneName or "") .. ":" .. campSize
+local function densityKey(npcId, zoneName, sourceZoneId, campSize)
+    return npcId .. ":" .. tostring(zoneName or "") .. ":"
+        .. tostring(sourceZoneId or "") .. ":" .. campSize
 end
 
-local function computeAndMemoDensity(npcId, zoneName, campSize, maybeYield)
-    local key = densityKey(npcId, zoneName, campSize)
+local function computeAndMemoDensity(npcId, zoneName, sourceZoneId, campSize, maybeYield)
+    local key = densityKey(npcId, zoneName, sourceZoneId, campSize)
     local memo = AF.mobDensity[key]
     if memo ~= nil then
         return memo
     end
-    local info = questieSpawnPoints(npcId, zoneName)
-    local geo = info and spawnGeometry(info.points, campSize, maybeYield)
+    local info = questieSpawnPoints(npcId, zoneName, sourceZoneId)
+    local geo = info
+        and spawnGeometry(info.metricPoints, campSize, maybeYield, info.unit)
     if not geo then
         AF.mobDensity[key] = false
         return false
     end
     geo.matchedZone = info.matchedZone
-    -- A single spawn point ranks excellent for the DENSITY filter (there is no
-    -- walking); whether one mob is worth camping is the spawn threshold's call.
-    geo.rank = DENSITY_RANK[geo.grade] or 3
-    if geo.camp then
-        geo.camp.rank = DENSITY_RANK[geo.camp.grade] or 3
+    geo.matchedBy = info.matchedBy
+    geo.zoneId = info.zoneId
+    geo.zoneName = info.zoneName
+    geo.uiMapId = info.uiMapId
+    geo.instanceId = info.instanceId
+    -- Only a full requested camp measured in world yards may drive filtering.
+    -- Short camps and percent-map fallbacks stay visible as unknown.
+    if geo.camp and geo.camp.confident then
+        geo.camp.rank = DENSITY_RANK[geo.camp.grade]
     end
     AF.mobDensity[key] = geo
     return geo
 end
 
-function AF.GetMobDensity(npcId, zoneName, campSize)
+function AF.GetMobDensity(npcId, zoneName, campSize, sourceZoneId)
     npcId = tonumber(npcId)
     if not npcId then
         return nil
     end
-    local result = computeAndMemoDensity(npcId, zoneName, math.floor(tonumber(campSize) or 0))
+    local result = computeAndMemoDensity(
+        npcId, zoneName, sourceZoneId, math.floor(tonumber(campSize) or 0))
     return result or nil
 end
 
-function AF.PeekMobDensity(npcId, zoneName, campSize)
+function AF.PeekMobDensity(npcId, zoneName, campSize, sourceZoneId)
     npcId = tonumber(npcId)
     if not npcId then
         return nil, false
     end
-    local memo = AF.mobDensity[densityKey(npcId, zoneName, math.floor(tonumber(campSize) or 0))]
+    local memo = AF.mobDensity[densityKey(
+        npcId, zoneName, sourceZoneId, math.floor(tonumber(campSize) or 0))]
     if memo == nil then
         return nil, true
     end
@@ -608,7 +833,7 @@ local densityRunning = false
 local densityQueue = {}
 local densityQueued = {}
 local densityOnDone = {}
--- Chat progress like the scans ("Scan pack density started / at 50% /
+-- Chat progress like the scans ("Scan farm density started / at 50% /
 -- finished"), so the background work is visible to the user. Only for runs
 -- worth announcing (>= DENSITY_PROGRESS_MIN mobs) -- small top-up runs after
 -- a filter tweak stay silent. The total is re-derived every step because the
@@ -634,8 +859,8 @@ local function densityFlushCallbacks()
     end
 end
 
--- The budget must bound even a SINGLE item's cost (a 200-point mob's
--- best-camp search alone can take far longer than one frame), so each
+-- The budget must bound even a SINGLE item's cost (a large mob's all-points
+-- best-camp search can take far longer than one frame), so each
 -- computation runs in a coroutine that yields whenever the CURRENT tick's
 -- budget is spent. `tickBudgetHit` is a shared upvalue refreshed every tick:
 -- a coroutine created in an earlier tick must consult THIS tick's deadline
@@ -670,7 +895,8 @@ local function densityTick()
             densityQueue[#densityQueue] = nil
             densityQueued[req.key] = nil
             densityJob = coroutine.create(function()
-                computeAndMemoDensity(req.npcId, req.zoneName, req.campSize, densityMaybeYield)
+                computeAndMemoDensity(
+                    req.npcId, req.zoneName, req.zoneId, req.campSize, densityMaybeYield)
             end)
         end
         local ok = coroutine.resume(densityJob)
@@ -704,16 +930,21 @@ local function densityTick()
     end
 end
 
-function AF.RequestMobDensities(requests, onDone)
+-- `quiet` suppresses the chat progress narration for THIS call (used by the
+-- UI's background pre-warm, which the user did not explicitly ask for); a later
+-- non-quiet request that crosses the threshold still narrates its own work.
+function AF.RequestMobDensities(requests, onDone, quiet)
     for _, r in ipairs(requests or {}) do
         local npcId = tonumber(r.npcId)
         if npcId then
             local campSize = math.floor(tonumber(r.campSize) or 0)
-            local key = densityKey(npcId, r.zoneName, campSize)
+            local zoneId = tonumber(r.zoneId)
+            local key = densityKey(npcId, r.zoneName, zoneId, campSize)
             if AF.mobDensity[key] == nil and not densityQueued[key] then
                 densityQueued[key] = true
                 densityQueue[#densityQueue + 1] =
-                    { key = key, npcId = npcId, zoneName = r.zoneName, campSize = campSize }
+                    { key = key, npcId = npcId, zoneName = r.zoneName,
+                      zoneId = zoneId, campSize = campSize }
             end
         end
     end
@@ -733,10 +964,11 @@ function AF.RequestMobDensities(requests, onDone)
     -- Announce in chat once the run is big enough to be worth narrating --
     -- including when a running quiet run grows past the threshold. Created
     -- BEFORE the ticker starts: the first tick may already complete work.
-    if not densityProgress
+    if not quiet
+        and not densityProgress
         and (densityProcessedRun + outstanding) >= DENSITY_PROGRESS_MIN
         and type(I.Scan) == "table" and type(I.Scan.makeProgress) == "function" then
-        densityProgress = I.Scan.makeProgress("pack density")
+        densityProgress = I.Scan.makeProgress("farm density")
     end
     if not densityRunning then
         densityRunning = true
@@ -1129,6 +1361,80 @@ function AF.TryWarpToMob(entry)
 end
 
 
+-- Diagnostic: trace every step of dungeon/zone spawn resolution so /af mobdbg
+-- can show exactly where farm density falls back to unknown. Returns an array
+-- of human-readable lines.
+local function debugSpawnResolution(npcId, zoneName, sourceZoneId)
+    local out = {}
+    local function add(fmt, ...) out[#out + 1] = string.format(fmt, ...) end
+    npcId = tonumber(npcId)
+    local srcInstance = tonumber(sourceZoneId)
+    srcInstance = srcInstance and srcInstance >= 32768 and (srcInstance - 32768) or nil
+    add("inputs: npcId=%s zoneName=%s sourceZoneId=%s -> instance=%s",
+        tostring(npcId), tostring(zoneName), tostring(sourceZoneId), tostring(srcInstance))
+
+    local compat = rawget(_G, "QuestieCompat")
+    local mapData = type(compat) == "table" and compat.UiMapData
+    local hbd = type(compat) == "table" and compat.HBD
+    local mapCount = 0
+    if type(mapData) == "table" then for _ in pairs(mapData) do mapCount = mapCount + 1 end end
+    add("env: QuestieLoader=%s QuestieCompat=%s UiMapData=%d HBD=%s",
+        tostring(rawget(_G, "QuestieLoader") ~= nil), tostring(compat ~= nil), mapCount,
+        tostring(type(hbd) == "table" and type(hbd.GetWorldCoordinatesFromZone) == "function"))
+
+    local spawns = npcId and getQuestieNpcSpawns(npcId)
+    if type(spawns) ~= "table" then
+        -- Distinguish "id unknown to Questie" from "id known but has no spawns"
+        -- (Questie can hold a spawn-less duplicate, e.g. Drakkari Frenzy (1)).
+        local db = importQuestieDB()
+        local hasQuery = type(db) == "table" and type(db.QueryNPCSingle) == "function"
+        local qName = hasQuery and safeFirst(db.QueryNPCSingle, npcId, "name") or nil
+        add("getQuestieNpcSpawns -> nil. db=%s QueryNPCSingle=%s GetNPC=%s",
+            tostring(type(db)), tostring(hasQuery),
+            tostring(type(db) == "table" and type(db.GetNPC) == "function"))
+        add("  Questie name for id %s = %s (%s)", tostring(npcId), tostring(qName),
+            qName and "id is in Questie but carries no spawns"
+                or "id is NOT in Questie's NPC DB -- likely a server-specific creature id")
+        return out
+    end
+    local zoneDb = importQuestieModule("ZoneDB")
+    local dungeons = type(zoneDb) == "table" and type(zoneDb.GetDungeons) == "function"
+        and safeFirst(zoneDb.GetDungeons, zoneDb) or nil
+    for key, zoneSpawns in pairs(spawns) do
+        if type(zoneSpawns) == "table" then
+            local rawName = type(_G.Custom_GetZoneName) == "function"
+                and safeFirst(_G.Custom_GetZoneName, key) or nil
+            local dungeonName = type(dungeons) == "table" and dungeons[tonumber(key)]
+                and dungeons[tonumber(key)][1] or nil
+            local uiDirect = type(zoneDb) == "table" and type(zoneDb.GetUiMapIdByAreaId) == "function"
+                and safeFirst(zoneDb.GetUiMapIdByAreaId, zoneDb, tonumber(key)) or nil
+            local cands = questieUiMapCandidates(zoneDb, key, srcInstance)
+            add("  key=%s pts=%d Custom_GetZoneName=%s GetDungeons.name=%s GetUiMapIdByAreaId=%s candidates=[%s] resolvedInstance=%s",
+                tostring(key), #zoneSpawns, tostring(rawName), tostring(dungeonName),
+                tostring(uiDirect), table.concat(cands, ","),
+                tostring(questieZoneInstanceId(zoneDb, key)))
+            add("    matches: byZoneId=%s byInstance=%s byLooseName(%s vs %s)=%s",
+                tostring(tonumber(key) == tonumber(sourceZoneId)),
+                tostring(srcInstance ~= nil and questieZoneInstanceId(zoneDb, key) == srcInstance),
+                tostring(questieAreaName(zoneDb, key)), tostring(zoneName),
+                tostring(isSameZoneNameLoose(questieAreaName(zoneDb, key), zoneName)))
+        end
+    end
+    add("byInstance(%s)=[%s] byName(%s)=[%s]",
+        tostring(srcInstance), table.concat(uiMapIdsByInstance(srcInstance) or {}, ","),
+        tostring(zoneName), table.concat(uiMapIdsByName(zoneName) or {}, ","))
+
+    local info = questieSpawnPoints(npcId, zoneName, sourceZoneId)
+    if not info then
+        add("questieSpawnPoints -> nil (NO MATCH -> density unavailable)")
+    else
+        add("questieSpawnPoints -> matchedBy=%s zoneId=%s unit=%s uiMapId=%s instanceId=%s pts=%d",
+            tostring(info.matchedBy), tostring(info.zoneId), tostring(info.unit),
+            tostring(info.uiMapId), tostring(info.instanceId), #(info.points or {}))
+    end
+    return out
+end
+
 I.Warp = {
     REQUIRED_WARP_TIER = REQUIRED_WARP_TIER,
     WARP_ZONE_INDEX = WARP_ZONE_INDEX,
@@ -1137,4 +1443,5 @@ I.Warp = {
     qtRunnerWarpIndex = qtRunnerWarpIndex,
     questieSpawnPoints = questieSpawnPoints,
     spawnGeometry = spawnGeometry,
+    debugSpawnResolution = debugSpawnResolution,
 }

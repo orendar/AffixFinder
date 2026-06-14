@@ -41,6 +41,7 @@ local isSameZoneName = Warp.isSameZoneName
 local qtRunnerWarpIndex = Warp.qtRunnerWarpIndex
 local questieSpawnPoints = Warp.questieSpawnPoints
 local spawnGeometry = Warp.spawnGeometry
+local debugSpawnResolution = Warp.debugSpawnResolution
 local normZoneKey = ZoneClassify.normZoneKey
 
 -- Diagnostic: shows how the zones in the current data classify (category /
@@ -396,9 +397,9 @@ local function mobSourceStats(itemId, npcId, zoneName)
     return stats
 end
 
--- Spawn-pack geometry over Questie spawn points (percent-of-zone-map units).
+-- Farm-density geometry over Questie spawn points (world yards when available).
 --
--- (Spawn-pack geometry lives in AffixFinderWarp.lua next to its Questie data
+-- (Farm-density geometry lives in AffixFinderWarp.lua next to its Questie data
 -- source: spawnGeometry / AF.GetMobDensity. mobdbg only renders it.)
 
 -- Recomputes one mob aggregate from live data, per item. Pure computation
@@ -411,7 +412,7 @@ local function buildMobDiagnosis(data, mob)
     local includeMythics = data.includeMythics and true or false
     local items = {}
     local recomputedEv = 0
-    for _, itemId in ipairs(mob.items or {}) do
+    for itemId in pairs(mob.items or {}) do
         local value = affixedItemValue(itemId, data.scope, data.forgeFilter,
             data.bindFilter, includeMythics, false)
         local stats = mobSourceStats(itemId, mob.npcId, mob.zoneName)
@@ -477,14 +478,14 @@ local function buildMobDiagnosis(data, mob)
     diag.variants = {}
     local ownKey = normZoneKey(mob.zoneName)
     local ownItems = {}
-    for _, itemId in ipairs(mob.items or {}) do
+    for itemId in pairs(mob.items or {}) do
         ownItems[itemId] = true
     end
     for _, other in pairs(data.mobsByKey) do
         if other ~= mob and other.npcId == mob.npcId
             and normZoneKey(other.zoneName) == ownKey then
             local shared = 0
-            for _, itemId in ipairs(other.items or {}) do
+            for itemId in pairs(other.items or {}) do
                 if ownItems[itemId] then
                     shared = shared + 1
                 end
@@ -504,46 +505,64 @@ local function buildMobDiagnosis(data, mob)
     return diag
 end
 
-local function printPackGeometry(mob, showSpawns, campSize)
-    local spawnInfo = questieSpawnPoints and questieSpawnPoints(mob.npcId, mob.zoneName)
-    if not spawnInfo then
-        chat("  Pack density: unavailable (Questie not loaded, or no spawn data for this NPC).")
+-- Dump the step-by-step spawn resolution trace (why density is/ isn't graded).
+local function printSpawnResolution(mob)
+    if not debugSpawnResolution then
         return
     end
-    local geo = spawnGeometry(spawnInfo.points, campSize)
+    chat("  Farm density resolution trace:")
+    for _, line in ipairs(debugSpawnResolution(mob.npcId, mob.zoneName, mob.zoneId)) do
+        chat("    " .. line)
+    end
+end
+
+local function printPackGeometry(mob, showSpawns, campSize)
+    local spawnInfo = questieSpawnPoints
+        and questieSpawnPoints(mob.npcId, mob.zoneName, mob.zoneId)
+    if not spawnInfo then
+        chat("  Farm density: unavailable (Questie missing, no spawn data, or no matching zone/instance).")
+        printSpawnResolution(mob)
+        return
+    end
+    local geo = spawnGeometry(spawnInfo.metricPoints, campSize, nil, spawnInfo.unit)
     if not geo then
-        chat("  Pack density: Questie has no usable coordinates for this NPC.")
+        chat("  Farm density: Questie has no usable coordinates for this NPC.")
         return
     end
 
-    local zoneNote = ""
-    if not spawnInfo.matchedZone then
-        zoneNote = string.format(" [zone match FAILED; fallback data from '%s' (id %s) -- treat as approximate]",
-            tostring(spawnInfo.zoneName or "?"), tostring(spawnInfo.zoneId))
-    end
     if geo.points == 1 then
-        chat("  Pack density (Questie): 1 spawn point -- a fixed camp; density is moot (respawn-bound)." .. zoneNote)
+        chat("  Farm density (Questie): unknown -- only 1 spawn point is mapped.")
     else
         local sampleNote = (geo.sampled < geo.points)
-            and (" (geometry sampled over " .. geo.sampled .. ")") or ""
-        -- The headline is the BEST CAMP (the densest min-spawns-sized pocket
-        -- -- what a player actually farms); the whole pack is context.
+            and ("; supporting shape sampled over " .. geo.sampled) or ""
         if geo.camp then
-            local shortNote = geo.camp.short
-                and " (fewer points mapped than the min-spawns camp asked for)" or ""
-            chat(string.format("  Pack density (Questie): %s -- best camp of %d%s: ~%.1f%% of the map walked per kill. Whole pack: %s (~%.1f%%/kill, %d points%s, lap ~%.0f%%).",
-                geo.camp.grade, geo.camp.size, shortNote, geo.camp.walkPerKill,
-                geo.grade, geo.walkPerKill, geo.points, sampleNote, geo.routeLen) .. zoneNote)
-        else
-            chat(string.format("  Pack density (Questie): %s -- ~%.1f%% of the map walked per kill (%d spawn points%s, full lap ~%.0f%%).",
-                geo.grade, geo.walkPerKill, geo.points, sampleNote, geo.routeLen) .. zoneNote)
+            local camp = geo.camp
+            if camp.short then
+                chat(string.format("  Farm density (Questie): unknown -- you asked to pull %d, but only %d spawn points are mapped.",
+                    camp.requested, camp.size))
+            elseif geo.unit == "yards" then
+                local pulls = camp.pullsNeeded == 1 and "1 pull" or (camp.pullsNeeded .. " pulls")
+                chat(string.format("  Farm density (Questie): %s -- ~%s to gather %d (best single pull %d of %d mapped within %.0f yd).",
+                    camp.grade, pulls, camp.requested, camp.pullCount, camp.size, camp.pullRadius))
+            else
+                chat(string.format("  Farm density (Questie): ungraded -- best single pull %d of %d mapped spawns within one %.0f%% map circle, but world-yard scaling is unavailable.",
+                    camp.pullCount, camp.size, camp.pullRadius))
+            end
         end
         local clusterText = tostring(geo.clusters)
         if geo.clusters > 1 and geo.clusters <= 5 and geo.clusterSizes then
             clusterText = clusterText .. " (" .. table.concat(geo.clusterSizes, "+") .. " points)"
         end
-        chat(string.format("    shape: %s; clusters %s covering %.0f%% x %.0f%%; gap between neighbors %.1f%% avg / %.1f%% max. Units are %% of the zone map, so compare within a zone.",
-            geo.shape, clusterText, geo.spanX, geo.spanY, geo.meanGap, geo.maxGap))
+        local unit = geo.unit == "yards" and " yd" or "% map"
+        chat(string.format("    shape: %s; clusters %s; span %.0f x %.0f%s; neighbor gap %.1f avg / %.1f max%s%s.",
+            geo.shape, clusterText, geo.spanX, geo.spanY, unit,
+            geo.meanGap, geo.maxGap, unit, sampleNote))
+    end
+
+    -- When density did NOT reach a confident yard grade (or on explicit request),
+    -- dump the resolution trace so the failing step is visible.
+    if showSpawns or not (geo.camp and geo.camp.confident) then
+        printSpawnResolution(mob)
     end
 
     -- Mapped points vs the server's reported spawn count: a big mismatch means
@@ -724,9 +743,10 @@ local function printMobDebug(options)
 
         chat("Mob diagnosis (" .. filterCaption(scope, options.forgeFilter, options.bindFilter)
             .. ", mythics " .. (data.includeMythics and "on" or "off") .. "):")
-        -- Camp size for the density headline: the configured min-spawns
-        -- threshold, so "dense enough" and "numerous enough" agree.
-        local campSize = math.max(tonumber(options.minSpawns) or 0, 2)
+        -- N for the density headline: the configured min-spawns threshold,
+        -- floored at 5 (matching BuildMobList) so the pulls-to-gather-N grade
+        -- stays meaningful at small thresholds.
+        local campSize = math.max(tonumber(options.minSpawns) or 0, 5)
         local fullSections = math.min(#matches, 3)
         for i = 1, fullSections do
             printMobDiagnosis(data, matches[i], limit, options.breakdown, campSize)

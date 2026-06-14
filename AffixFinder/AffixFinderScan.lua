@@ -1217,6 +1217,64 @@ local function persistAttunableIds(ids, level)
     db.attunableCache = { max = MAX_ITEMID, level = level, ids = ids }
 end
 
+-- ---------------------------------------------------------------------------
+-- Cross-session kill-tally persistence (A)
+-- ---------------------------------------------------------------------------
+-- The kill tally (zoneName -> npcId -> max spawns, plus zoneName -> source zone
+-- id) is a pure aggregate of STATIC source data -- NOT the item graph and NOT
+-- per-source rows -- so, like the id lists, it is safe to persist. It rides
+-- inside the SAME cache entry the id list lives in (affixCache / attunableCache),
+-- sharing that entry's MAX_ITEMID (+ level) fingerprint, so the tally can never
+-- desync from the list it was built from and ClearAll (which drops those
+-- entries) drops it too. The payoff: the FIRST scan of every session loads the
+-- tally and takes the "already built" path -- walking sources only for items
+-- that pass the value gate (few on a developed account) instead of the full
+-- pre-gate walk over every candidate id, which is the recurring multi-second
+-- wait. (Fresh accounts see little gain -- most gates pass -- but they are not
+-- the ones re-scanning daily.)
+local function killTallyCacheKey(which)
+    return (which == "affix") and "affixCache" or "attunableCache"
+end
+
+local function persistKillTally(which, kills, zoneIds)
+    local db = _G.AffixFinderDB
+    if type(db) ~= "table" then
+        return
+    end
+    local cache = db[killTallyCacheKey(which)]
+    -- Attach only to a present, fingerprint-matching id-list entry: the tally
+    -- must travel with the exact list it was built from. (Same reference, never
+    -- mutated after this, so there is no copy cost.)
+    if type(cache) ~= "table" or cache.max ~= MAX_ITEMID then
+        return
+    end
+    cache.kills = kills
+    cache.zoneIds = zoneIds
+end
+
+local function loadPersistedKillTally(which, ids)
+    local db = _G.AffixFinderDB
+    local cache = type(db) == "table" and db[killTallyCacheKey(which)]
+    if type(cache) == "table" and cache.max == MAX_ITEMID
+        and type(cache.kills) == "table" and type(cache.zoneIds) == "table" then
+        -- Bind to the id list we just loaded so the identity check in the scan
+        -- (tally.ids == ids) recognises it as built-for-this-list.
+        AF.killTallies[which] = { ids = ids, kills = cache.kills, zoneIds = cache.zoneIds }
+    end
+end
+
+-- Stores a freshly-built tally on the session table AND persists it. One place
+-- so the single-mode scans and the combined walk all commit identically.
+local function commitAffixTally(ids, kills, zoneIds)
+    AF.killTallies.affix = { ids = ids, kills = kills, zoneIds = zoneIds }
+    persistKillTally("affix", kills, zoneIds)
+end
+
+local function commitAttuneTally(ids, kills, zoneIds)
+    AF.killTallies.attune = { ids = ids, kills = kills, zoneIds = zoneIds }
+    persistKillTally("attune", kills, zoneIds)
+end
+
 -- The usable attunable-id list (memo while its level stamp holds, else the
 -- persisted list, loaded into the memo), or nil when a discovery pass is
 -- needed. Checking the memo stamp here -- on every scan, rather than on a
@@ -1231,6 +1289,7 @@ local function currentAttunableIds()
     if persisted then
         AF.attunableItemIds = persisted
         AF.attunableItemIdsLevel = persistedLevel
+        loadPersistedKillTally("attune", persisted)
         return persisted
     end
     return nil
@@ -1289,6 +1348,7 @@ local function ensureAffixedIds(onReady)
     local persisted = loadPersistedAffixIds()
     if persisted then
         AF.affixedItemIds = persisted
+        loadPersistedKillTally("affix", persisted)
         onReady(persisted)
         return
     end
@@ -1390,6 +1450,133 @@ local function foldSourcesIntoTally(sources, kills, zoneIds)
     end
 end
 
+-- Folds ONE affixed item's value + its (already-fetched, non-empty) sources
+-- into the affix slice tables. Lifted out of the scan hot loop so the
+-- single-mode affix scan and the combined affix+attune walk (B) share one copy
+-- of the per-item accumulation. `ctx` carries the slice-build tables and the
+-- snapshotted forge factor; ctx.scanned counts the items that landed. The caller
+-- owns the value gate and the "no affixes left and not whole-item unattuned"
+-- skip (it decides whether sources are even worth fetching).
+local function accumulateAffix(ctx, itemId, value, sources)
+    ctx.scanned = ctx.scanned + 1
+    local rowsByZone, rows = ctx.rowsByZone, ctx.rows
+    local mobsByKey, itemsById = ctx.mobsByKey, ctx.itemsById
+    local forgeDropChance = ctx.forgeDropChance
+    local affixesLeft = value.affixesLeft
+    local valuePerDrop = value.valuePerDrop
+    local unattuned = value.unattuned
+    local category = value.category
+    local classes = value.classes
+
+    -- Record the item once (only when it still has affixes left, since only
+    -- those reach the mob lists below and the Items panel).
+    if affixesLeft > 0 and not itemsById[itemId] then
+        itemsById[itemId] = {
+            itemId = itemId,
+            category = category,
+            possible = value.possible,
+            affixesLeft = affixesLeft,
+            unattuned = unattuned,
+            classes = classes,
+        }
+    end
+
+    local seenZone = {}
+    for s = 1, #sources do
+        local src = sources[s]
+        local zoneName = src.zoneName
+
+        -- Per-zone counts: count the item once per distinct zone.
+        if not seenZone[zoneName] then
+            seenZone[zoneName] = true
+            local row = rowsByZone[zoneName]
+            if not row then
+                row = newZoneRow(zoneName)
+                rowsByZone[zoneName] = row
+                rows[#rows + 1] = row
+            end
+            row.candidateItems = row.candidateItems + 1
+            if unattuned then
+                row.unattunedAffixedItems = row.unattunedAffixedItems + 1
+                addBreakdownCount(row.breakdown.unattunedAffixedItems, category, 1)
+            end
+            if affixesLeft > 0 then
+                row.affixedItemsWithAffixesLeft = row.affixedItemsWithAffixesLeft + 1
+                row.totalAffixesLeft = row.totalAffixesLeft + affixesLeft
+                addBreakdownCount(row.breakdown.affixedItemsWithAffixesLeft, category, 1)
+                addBreakdownCount(row.breakdown.totalAffixesLeft, category, affixesLeft)
+            end
+
+            -- Mirror the same counts into each class this item is for.
+            if classes then
+                for c in pairs(classes) do
+                    local ct = row.byClass[c]
+                    if not ct then
+                        ct = newClassZoneTally()
+                        row.byClass[c] = ct
+                    end
+                    if unattuned then
+                        ct.unattunedAffixedItems = ct.unattunedAffixedItems + 1
+                        addBreakdownCount(ct.breakdown.unattunedAffixedItems, category, 1)
+                    end
+                    if affixesLeft > 0 then
+                        ct.affixedItemsWithAffixesLeft = ct.affixedItemsWithAffixesLeft + 1
+                        ct.totalAffixesLeft = ct.totalAffixesLeft + affixesLeft
+                        addBreakdownCount(ct.breakdown.affixedItemsWithAffixesLeft, category, 1)
+                        addBreakdownCount(ct.breakdown.totalAffixesLeft, category, affixesLeft)
+                    end
+                end
+            end
+        end
+
+        -- Per-mob EV (only meaningful while affixes remain).
+        if affixesLeft > 0 then
+            local npcId = src.npcId
+            local mobKey = zoneName .. ":" .. npcId
+            local mob = mobsByKey[mobKey]
+            if not mob then
+                mob = {
+                    zoneName = zoneName,
+                    zoneId = src.zoneId,
+                    npcId = npcId,
+                    npcName = src.npcName,
+                    spawnedCount = src.spawnedCount,
+                    evPerKill = 0,
+                    itemsDropped = 0,
+                    affixesLeft = 0,
+                    items = {},
+                    byClass = {},
+                }
+                mobsByKey[mobKey] = mob
+            end
+            local evDelta = src.dropProbability * forgeDropChance * valuePerDrop
+            mob.evPerKill = mob.evPerKill + evDelta
+            mob.itemsDropped = mob.itemsDropped + 1
+            mob.affixesLeft = mob.affixesLeft + affixesLeft
+            mob.items[itemId] = src.dropProbability
+            if src.spawnedCount > mob.spawnedCount then
+                mob.spawnedCount = src.spawnedCount
+            end
+            if not mob.zoneId then
+                mob.zoneId = src.zoneId
+            end
+
+            if classes then
+                for c in pairs(classes) do
+                    local mc = mob.byClass[c]
+                    if not mc then
+                        mc = { evPerKill = 0, itemsDropped = 0, affixesLeft = 0 }
+                        mob.byClass[c] = mc
+                    end
+                    mc.evPerKill = mc.evPerKill + evDelta
+                    mc.itemsDropped = mc.itemsDropped + 1
+                    mc.affixesLeft = mc.affixesLeft + affixesLeft
+                end
+            end
+        end
+    end
+end
+
 -- Produces (and caches in memory) the aggregated data for a scope/forge/bind:
 -- the per-zone affix totals and the per-mob expected value. All zone/EV/current
 -- views format from this; only the source graph is transient. Async: calls
@@ -1427,12 +1614,11 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
         local killsByZoneNpc = building and {} or tallyCached.kills
         local zoneIdsByName = building and {} or tallyCached.zoneIds
         -- Central per-item record (in-memory aggregate, like mobsByKey -- never
-        -- persisted). One entry per affixed item that still has affixes left and
-        -- a killable source; the Items panel and per-item views read it without a
-        -- rescan. Holds only small scalars + the shared category/class set (no
-        -- source rows, no strings beyond category); mobs carry the id lists.
-        local itemsById = {}
-        local affixedItemsScanned = 0
+        -- persisted; held on ctx.itemsById). One entry per affixed item that
+        -- still has affixes left and a killable source; the Items panel and
+        -- per-item views read it without a rescan. Holds only small scalars +
+        -- the shared category/class set (no source rows, no strings beyond
+        -- category); mobs carry the id lists.
         -- Source rows report the chance the item drops AT ALL; a forged slice
         -- only cares about the copies that roll at/above the threshold's floor
         -- (TF+ ~5.8% of drops at 0 FP). One scan-wide factor: it depends only
@@ -1445,6 +1631,10 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
         -- Per-class breakdown only matters in account scope (character scope is
         -- already a single class); skip the work otherwise.
         local perClass = (scope == "account")
+        local ctx = {
+            rows = rows, rowsByZone = rowsByZone, mobsByKey = mobsByKey,
+            itemsById = {}, forgeDropChance = forgeDropChance, scanned = 0,
+        }
 
         runChunked(#ids, function(i)
             local itemId = ids[i]
@@ -1475,128 +1665,10 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
             if #sources == 0 then
                 return
             end
-            affixedItemsScanned = affixedItemsScanned + 1
-
-            local affixesLeft = value.affixesLeft
-            local valuePerDrop = value.valuePerDrop
-            local unattuned = value.unattuned
-            local category = value.category
-            local classes = value.classes
-
-            -- Record the item once (only when it still has affixes left, since
-            -- only those reach the mob lists below and the Items panel).
-            if affixesLeft > 0 and not itemsById[itemId] then
-                itemsById[itemId] = {
-                    itemId = itemId,
-                    category = category,
-                    possible = value.possible,
-                    affixesLeft = affixesLeft,
-                    unattuned = unattuned,
-                    classes = classes,
-                }
-            end
-
-            local seenZone = {}
-            for s = 1, #sources do
-                local src = sources[s]
-                local zoneName = src.zoneName
-
-                -- Per-zone counts: count the item once per distinct zone.
-                if not seenZone[zoneName] then
-                    seenZone[zoneName] = true
-                    local row = rowsByZone[zoneName]
-                    if not row then
-                        row = newZoneRow(zoneName)
-                        rowsByZone[zoneName] = row
-                        rows[#rows + 1] = row
-                    end
-                    row.candidateItems = row.candidateItems + 1
-                    if unattuned then
-                        row.unattunedAffixedItems = row.unattunedAffixedItems + 1
-                        addBreakdownCount(row.breakdown.unattunedAffixedItems, category, 1)
-                    end
-                    if affixesLeft > 0 then
-                        row.affixedItemsWithAffixesLeft = row.affixedItemsWithAffixesLeft + 1
-                        row.totalAffixesLeft = row.totalAffixesLeft + affixesLeft
-                        addBreakdownCount(row.breakdown.affixedItemsWithAffixesLeft, category, 1)
-                        addBreakdownCount(row.breakdown.totalAffixesLeft, category, affixesLeft)
-                    end
-
-                    -- Mirror the same counts into each class this item is for.
-                    if classes then
-                        for c in pairs(classes) do
-                            local ct = row.byClass[c]
-                            if not ct then
-                                ct = newClassZoneTally()
-                                row.byClass[c] = ct
-                            end
-                            if unattuned then
-                                ct.unattunedAffixedItems = ct.unattunedAffixedItems + 1
-                                addBreakdownCount(ct.breakdown.unattunedAffixedItems, category, 1)
-                            end
-                            if affixesLeft > 0 then
-                                ct.affixedItemsWithAffixesLeft = ct.affixedItemsWithAffixesLeft + 1
-                                ct.totalAffixesLeft = ct.totalAffixesLeft + affixesLeft
-                                addBreakdownCount(ct.breakdown.affixedItemsWithAffixesLeft, category, 1)
-                                addBreakdownCount(ct.breakdown.totalAffixesLeft, category, affixesLeft)
-                            end
-                        end
-                    end
-                end
-
-                -- Per-mob EV (only meaningful while affixes remain).
-                if affixesLeft > 0 then
-                    local npcId = src.npcId
-                    local mobKey = zoneName .. ":" .. npcId
-                    local mob = mobsByKey[mobKey]
-                    if not mob then
-                        mob = {
-                            zoneName = zoneName,
-                            npcId = npcId,
-                            npcName = src.npcName,
-                            spawnedCount = src.spawnedCount,
-                            evPerKill = 0,
-                            itemsDropped = 0,
-                            affixesLeft = 0,
-                            -- itemIds this mob drops that still have affixes left
-                            -- (refs into itemsById; the Items panel reads these).
-                            items = {},
-                            -- Account scope only: per-class EV/items/affixes for
-                            -- this mob (classToken -> tally). Empty otherwise.
-                            byClass = {},
-                        }
-                        mobsByKey[mobKey] = mob
-                    end
-                    local evDelta = src.dropProbability * forgeDropChance * valuePerDrop
-                    mob.evPerKill = mob.evPerKill + evDelta
-                    mob.itemsDropped = mob.itemsDropped + 1
-                    mob.affixesLeft = mob.affixesLeft + affixesLeft
-                    mob.items[#mob.items + 1] = itemId
-                    if src.spawnedCount > mob.spawnedCount then
-                        mob.spawnedCount = src.spawnedCount
-                    end
-
-                    if classes then
-                        for c in pairs(classes) do
-                            local mc = mob.byClass[c]
-                            if not mc then
-                                mc = { evPerKill = 0, itemsDropped = 0, affixesLeft = 0 }
-                                mob.byClass[c] = mc
-                            end
-                            mc.evPerKill = mc.evPerKill + evDelta
-                            mc.itemsDropped = mc.itemsDropped + 1
-                            mc.affixesLeft = mc.affixesLeft + affixesLeft
-                        end
-                    end
-                end
-            end
+            accumulateAffix(ctx, itemId, value, sources)
         end, function()
             if building then
-                AF.killTallies.affix = {
-                    ids = ids,
-                    kills = killsByZoneNpc,
-                    zoneIds = zoneIdsByName,
-                }
+                commitAffixTally(ids, killsByZoneNpc, zoneIdsByName)
             end
             finish({
                 scope = scope,
@@ -1610,10 +1682,10 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
                 rows = rows,
                 rowsByZone = rowsByZone,
                 mobsByKey = mobsByKey,
-                itemsById = itemsById,
+                itemsById = ctx.itemsById,
                 killsByZoneNpc = killsByZoneNpc,
                 zoneIdsByName = zoneIdsByName,
-                affixedItemsScanned = affixedItemsScanned,
+                affixedItemsScanned = ctx.scanned,
             })
         end, progress)
     end)
@@ -1723,18 +1795,22 @@ end
 -- single class (and drops mobs that drop nothing for that class). nil = account.
 --
 -- minDensityRank (optional, 1-3 vs AF.DENSITY_GRADE_BY_RANK; nil/0 = off)
--- drops mobs whose BEST CAMP density (the densest minSpawns-sized pocket of
--- Questie spawn points -- see AF.GetMobDensity in AffixFinderWarp.lua) grades
--- below the rank. Mobs with UNKNOWN density (no Questie / no spawn data) are
--- KEPT: missing data is not evidence of sparseness, and without Questie the
--- filter would otherwise silently empty the list. Each kept row gets a
--- display-only `density` field (the shared memoized geometry table, nil when
--- unknown) so views can show the grade without recomputing.
+-- drops mobs whose farm density (how many AoE pulls it takes to gather minSpawns
+-- of the mob from its Questie spawn points -- see AF.GetMobDensity in
+-- AffixFinderWarp.lua) grades below the rank. Mobs with UNKNOWN density (no
+-- Questie, no matching zone/instance scale, or incomplete camp data) are KEPT
+-- only at the LENIENT ranks (fair+): missing data is not evidence of sparseness,
+-- and without Questie the filter would otherwise silently empty the list. At the
+-- STRICT ranks (good+/excellent) unknown density is DROPPED -- a strict filter
+-- means the user wants confirmed-quality camps, not unprovable ones. Each kept
+-- row gets a display-only `density` field (the shared memoized geometry table,
+-- nil when unknown) so views can show the grade without recomputing.
 --
 -- NEVER computes geometry: it only PEEKS the density memo (computing a whole
 -- mob list inline froze the client for seconds). Mobs whose density is not
--- memoized yet stay VISIBLE and are returned in the second return value, an
--- array of { npcId, zoneName, campSize } the caller hands to
+-- memoized yet stay VISIBLE (even under strict ranks -- they may resolve to a
+-- passing grade) and are returned in the second return value, an
+-- array of { npcId, zoneName, zoneId, campSize } the caller hands to
 -- AF.RequestMobDensities for time-budgeted background computation, then
 -- re-renders on its onDone (the list tightens once, when the memo is full).
 -- Returns: rows, pendingDensity|nil.
@@ -1744,11 +1820,16 @@ function AF.BuildMobList(data, minSpawns, classToken, minDensityRank)
         minSpawns = 0
     end
     local wantRank = tonumber(minDensityRank) or 0
+    -- At or above this filter rank (good+), mobs with UNKNOWN density are hidden
+    -- rather than kept: a strict filter means the user wants confirmed quality.
+    -- Below it (fair+), unknown stays visible so missing data never empties the list.
+    local STRICT_DENSITY_RANK = 2
     local peekFn = (wantRank > 0) and type(AF.PeekMobDensity) == "function"
         and AF.PeekMobDensity or nil
-    -- The camp must hold at least the spawn threshold's worth of points, so
-    -- the two filters answer one question ("a farmable camp of >= N").
-    local campSize = math.max(minSpawns, 2)
+    -- N for the density grade = the spawn threshold, but floored at 5: with a
+    -- tiny N the "pulls to gather N" grade collapses (gathering 2 never needs
+    -- more than 2 pulls), so below 5 the qualitative bands stop meaning much.
+    local campSize = math.max(minSpawns, 5)
     local pending = nil
 
     local mobs = {}
@@ -1757,14 +1838,24 @@ function AF.BuildMobList(data, minSpawns, classToken, minDensityRank)
             local density, densityPass = nil, true
             if peekFn then
                 local stillUnknown
-                density, stillUnknown = peekFn(mob.npcId, mob.zoneName, campSize)
+                density, stillUnknown =
+                    peekFn(mob.npcId, mob.zoneName, campSize, mob.zoneId)
                 if stillUnknown then
                     pending = pending or {}
                     pending[#pending + 1] =
-                        { npcId = mob.npcId, zoneName = mob.zoneName, campSize = campSize }
+                        { npcId = mob.npcId, zoneName = mob.zoneName,
+                          zoneId = mob.zoneId, campSize = campSize }
                 else
                     local rank = density and (density.camp and density.camp.rank or density.rank)
-                    if rank and rank < wantRank then
+                    if rank then
+                        if rank < wantRank then
+                            densityPass = false
+                        end
+                    elseif wantRank >= STRICT_DENSITY_RANK then
+                        -- Strict filters (good+/excellent) exclude mobs whose
+                        -- density cannot be confirmed: the user asked for quality
+                        -- camps, and "unknown" is not one. fair+ stays lenient and
+                        -- keeps unknown visible (missing data is not sparseness).
                         densityPass = false
                     end
                 end
@@ -1774,6 +1865,7 @@ function AF.BuildMobList(data, minSpawns, classToken, minDensityRank)
                 if mc and mc.affixesLeft > 0 then
                     mobs[#mobs + 1] = {
                         zoneName = mob.zoneName,
+                        zoneId = mob.zoneId,
                         npcId = mob.npcId,
                         npcName = mob.npcName,
                         spawnedCount = mob.spawnedCount,
@@ -1842,8 +1934,9 @@ end
 -- Returns the individual affixed ITEMS (one row per item id) that still have
 -- affixes left and drop from a killable mob passing the spawn / zone-substring /
 -- class filters. Pure display-time over the slice's itemsById + per-mob item
--- lists, so it never rescans. Each row carries the densest known source mob
--- (bestMob*) so a click can pin it like the Mobs panel.
+-- maps, so it never rescans. Each row carries the best known source mob
+-- (highest item drop chance, then spawn count; bestMob*) so a click can pin it
+-- like the Mobs panel.
 --   minSpawns  : drop mobs below this reported spawn count (like BuildMobList)
 --   classToken : account scope -- keep only items usable by this class (nil = all)
 --   zoneNeedle : case-insensitive substring on the source mob's zone (nil = all)
@@ -1859,10 +1952,11 @@ function AF.BuildItemList(data, minSpawns, classToken, zoneNeedle)
     for _, mob in pairs(data.mobsByKey) do
         if mob.items and mob.spawnedCount >= minSpawns
             and (not needle or (mob.zoneName and string.find(string.lower(mob.zoneName), needle, 1, true))) then
-            for _, itemId in ipairs(mob.items) do
+            for itemId, dropProbability in pairs(mob.items) do
                 local rec = itemsById[itemId]
                 if rec and rec.affixesLeft > 0
                     and ((not classToken) or (rec.classes and rec.classes[classToken])) then
+                    dropProbability = tonumber(dropProbability) or 0
                     local r = seen[itemId]
                     if not r then
                         r = {
@@ -1876,16 +1970,20 @@ function AF.BuildItemList(data, minSpawns, classToken, zoneNeedle)
                             bestMobNpcId = mob.npcId,
                             bestMobZone = mob.zoneName,
                             bestMobSpawns = mob.spawnedCount,
+                            bestMobDropProbability = dropProbability,
                         }
                         seen[itemId] = r
                         rows[#rows + 1] = r
                     end
                     r.sourceMobs = r.sourceMobs + 1
-                    if mob.spawnedCount > (r.bestMobSpawns or 0) then
+                    if dropProbability > (r.bestMobDropProbability or 0)
+                        or (dropProbability == (r.bestMobDropProbability or 0)
+                            and mob.spawnedCount > (r.bestMobSpawns or 0)) then
                         r.bestMobName = mob.npcName
                         r.bestMobNpcId = mob.npcId
                         r.bestMobZone = mob.zoneName
                         r.bestMobSpawns = mob.spawnedCount
+                        r.bestMobDropProbability = dropProbability
                     end
                 end
             end
@@ -2277,9 +2375,12 @@ end
 
 
 I.Scan = {
+    accumulateAffix = accumulateAffix,
     addBreakdownCount = addBreakdownCount,
     affixedItemValue = affixedItemValue,
     beginTask = beginTask,
+    commitAffixTally = commitAffixTally,
+    commitAttuneTally = commitAttuneTally,
     bestCreatureSource = bestCreatureSource,
     bitAnd = bitAnd,
     computeWithCache = computeWithCache,

@@ -223,15 +223,15 @@ spawnSlider.tooltipText = "Default minimum reported spawn count for a mob to app
 local DENSITY_SLIDER_LABELS = { [0] = "any", [1] = "fair or better", [2] = "good or better", [3] = "excellent only" }
 local densitySlider = BuildSlider(
     "AffixFinderDensitySlider",
-    "Default minimum pack density",
+    "Default minimum farm density",
     0, 3, 1,
     function(v) return DENSITY_SLIDER_LABELS[v] or tostring(v) end,
     "minDensity",
     spawnSlider, -48)
-densitySlider.tooltipText = "Default pack-density threshold for the Mobs view: how tightly a mob's "
-    .. "best camp of Min-spawns spawn points is packed (walk distance per kill, computed from "
-    .. "Questie's spawn data). Mobs whose density is unknown (Questie not loaded, or no data for "
-    .. "that NPC) always show. You can still override this per session in the window."
+densitySlider.tooltipText = "Default farm-density threshold for the Mobs view: how many AoE pulls it "
+    .. "takes to gather your Min-spawns count of that mob (computed in world yards from Questie's spawn "
+    .. "data) -- excellent 1 pull, good 2, fair 3, poor 4+. Unknown density (no Questie data for a mob) "
+    .. "shows at fair+ but is hidden at good+ and excellent. You can still override this per session."
 
 local speedSlider = BuildSlider(
     "AffixFinderSpeedSlider",
@@ -241,7 +241,7 @@ local speedSlider = BuildSlider(
     "scanBudget",
     densitySlider, -48)
 speedSlider.tooltipText = "How much of each frame the background scans (discovery, zone/resist/"
-    .. "new-item scans, pack density) may use. Higher finishes scans sooner at the cost of frame "
+    .. "new-item scans, farm density) may use. Higher finishes scans sooner at the cost of frame "
     .. "rate while they run; lower is smoother but slower. 10 is the default; drop to 3-6 for "
     .. "maximum smoothness."
 

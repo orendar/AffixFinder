@@ -572,9 +572,10 @@ local function BuildSearchSpawnControls(panel, strip, label, filterKey, placehol
         end)
         densityBtn:SetScript("OnEnter", function(s)
             GameTooltip:SetOwner(s, "ANCHOR_TOP")
-            GameTooltip:AddLine("Minimum pack density", 1, 1, 1)
-            GameTooltip:AddLine("How tightly this mob's best camp of Min-spawns points is packed (walk per kill, from Questie spawn data). Click to cycle: any, fair+, good+, excellent.", 0.8, 0.8, 0.8, true)
-            GameTooltip:AddLine("Mobs with unknown density (no Questie data) always show.", 0.8, 0.8, 0.8, true)
+            GameTooltip:AddLine("Minimum farm density", 1, 1, 1)
+            GameTooltip:AddLine("How many AoE pulls it takes to gather your Min-spawns count, from Questie's spawn map: excellent 1 pull, good 2, fair 3, poor 4+. Click to cycle: any, fair+, good+, excellent.", 0.8, 0.8, 0.8, true)
+            GameTooltip:AddLine("Respawn time is not included; the server does not expose it.", 0.8, 0.8, 0.8, true)
+            GameTooltip:AddLine("Unknown density (no Questie data for this mob) shows at fair+, but is hidden at good+ and excellent.", 0.8, 0.8, 0.8, true)
             GameTooltip:Show()
         end)
         densityBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -787,15 +788,23 @@ PANELS[#PANELS + 1] = {
         if d then
             local camp = d.camp
             if d.points == 1 then
-                lines[#lines + 1] = { left = "  Pack density", right = "single spawn point" }
+                lines[#lines + 1] = {
+                    left = "  Farm density",
+                    right = "unknown (1 spawn point mapped)",
+                }
             elseif camp then
-                local label = "  Pack density (best camp of " .. camp.size
-                    .. (camp.short and ", all that's mapped)" or ")")
-                lines[#lines + 1] = { left = label,
-                    right = string.format("%s (%.1f%%/kill)", camp.grade, camp.walkPerKill) }
-            else
-                lines[#lines + 1] = { left = "  Pack density",
-                    right = string.format("%s (%.1f%%/kill)", d.grade, d.walkPerKill or 0) }
+                local right
+                if camp.short then
+                    right = string.format("unknown (%d/%d points mapped)",
+                        camp.size, camp.requested)
+                elseif d.unit == "yards" then
+                    local pulls = camp.pullsNeeded == 1 and "1 pull"
+                        or (camp.pullsNeeded .. " pulls")
+                    right = string.format("%s (%s for %d)", camp.grade, pulls, camp.requested)
+                else
+                    right = string.format("best pull %d (ungraded)", camp.pullCount)
+                end
+                lines[#lines + 1] = { left = "  Farm density", right = right }
             end
         end
         if AF.GetConfig("automaticWarp") then
@@ -835,7 +844,7 @@ PANELS[#PANELS + 1] = {
           headerTooltip = "Total suffixes this item can roll.",
           value = function(e) return num(e.possible) end },
         { title = "Best mob", width = 128, justify = "LEFT",
-          headerTooltip = "Densest mob (by spawn count) that drops this item among the zones passing your filters. Click the row to pin it on the map.",
+          headerTooltip = "Mob with the highest drop chance for this item among the sources passing your filters; spawn count breaks ties. Click the row to pin it on the map.",
           value = function(e) return e.bestMobName or "" end },
     },
     -- Attune mode: every listed item is simply "not attuned yet", so the affix
@@ -846,7 +855,7 @@ PANELS[#PANELS + 1] = {
         { title = "Category", width = 100, justify = "LEFT",
           value = function(e) return e.category or "" end },
         { title = "Best mob", width = 146, justify = "LEFT",
-          headerTooltip = "Densest mob (by spawn count) that drops this item among the zones passing your filters. Click the row to pin it on the map.",
+          headerTooltip = "Mob with the highest drop chance for this item among the sources passing your filters; spawn count breaks ties. Click the row to pin it on the map.",
           value = function(e) return e.bestMobName or "" end },
         { title = "Sources", width = 60, justify = "RIGHT", numeric = true,
           headerTooltip = "Killable mobs that drop this item and pass your filters -- more sources means an easier farm.",
@@ -907,6 +916,8 @@ PANELS[#PANELS + 1] = {
             { left = "  Category", right = e.category or "?" },
             { left = "  Best mob", right = string.format("%s (%s, %d spawns)",
                 tostring(e.bestMobName or "?"), tostring(e.bestMobZone or "?"), num(e.bestMobSpawns)) },
+            { left = "  Item drop chance", right = string.format("%.3g%%",
+                num(e.bestMobDropProbability) * 100) },
             { left = "  Mobs that drop it (this filter)", right = tostring(num(e.sourceMobs)) },
         }
         -- Suffix detail is affix-mode only; in attune mode one attune of
@@ -2150,18 +2161,60 @@ function UI.RequestData()
         UI.dataSig = PanelSig(panel)
         UI.dataItemsScanned = data.affixedItemsScanned
         UI.RefreshActivePanel()
+        -- Hide the next two waits (C): warm the OTHER Find mode's slice is
+        -- already handled by ComputeFarmData's combined build; here we pre-warm
+        -- farm density for the mobs the user is about to be able to filter on,
+        -- so the first "Density" click is instant instead of a fresh geometry
+        -- pass. Quiet + budgeted, on its own worker, so it never hitches.
+        UI.PrefetchMobDensities(data)
     end
 
     -- A panel may declare its own data source (Resist -> ComputeResistData);
-    -- otherwise the shared panels read the mode's slice (scope/forge/bind):
-    -- ComputeZoneData in affix mode, ComputeAttuneData in attune mode (where
-    -- forge is the attunement threshold).
+    -- otherwise the shared panels read the mode's slice (scope/forge/bind).
+    -- ComputeFarmData builds the active mode's slice AND -- on the first scan,
+    -- when the other mode is still cold -- the other mode's slice in the SAME
+    -- source walk, so flipping Find mode is instant (B).
     if panel.fetch then
         panel.fetch(panel, handle)
-    elseif PanelMode(panel) == "attune" then
-        AF.ComputeAttuneData(UI.filters.scope, CurrentForgeFilter(), CurrentBindFilter(), handle)
     else
-        AF.ComputeZoneData(UI.filters.scope, CurrentForgeFilter(), CurrentBindFilter(), handle)
+        local mode = (PanelMode(panel) == "attune") and "attune" or "affix"
+        AF.ComputeFarmData(mode, UI.filters.scope, CurrentForgeFilter(), CurrentBindFilter(), handle)
+    end
+end
+
+-- Background pre-warm of farm-density geometry (C): once a shared scan paints,
+-- compute density for the mobs that meet the Mobs panel's current spawn floor,
+-- so toggling the Density filter later reads a warm memo instead of triggering
+-- a multi-second geometry pass. RequestMobDensities dedupes against the memo, so
+-- re-calling each scan is cheap; `quiet` keeps it out of the chat log.
+function UI.PrefetchMobDensities(data)
+    if not data or not data.mobsByKey or type(AF.RequestMobDensities) ~= "function" then
+        return
+    end
+    local minSpawns = AF.GetConfig("minSpawns") or 1
+    for _, p in ipairs(PANELS) do
+        if p.id == "mobs" and p.minSpawns then
+            minSpawns = p.minSpawns
+            break
+        end
+    end
+    -- Match BuildMobList's camp size so the warmed memo keys line up.
+    local campSize = math.max(minSpawns, 5)
+    local reqs = {}
+    for _, mob in pairs(data.mobsByKey) do
+        if (mob.spawnedCount or 0) >= minSpawns then
+            reqs[#reqs + 1] = {
+                npcId = mob.npcId, zoneName = mob.zoneName,
+                zoneId = mob.zoneId, campSize = campSize,
+            }
+        end
+    end
+    if #reqs > 0 then
+        AF.RequestMobDensities(reqs, function()
+            if UI.frame and UI.frame:IsShown() then
+                UI.RefreshActivePanel()
+            end
+        end, true)  -- quiet: the user did not ask for this
     end
 end
 

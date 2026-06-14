@@ -56,7 +56,12 @@ AF.attuneData = {}
 -- the value gate drops (the scan's dominant cost). Each entry is
 -- { ids, kills, zoneIds }, validated by the id table's IDENTITY: a
 -- rediscovery (level-up, ClearAll) makes a new table and the stale tally
--- simply stops matching. In-memory only, never persisted.
+-- simply stops matching. Also PERSISTED across sessions inside the same
+-- AffixFinderDB.affixCache / attunableCache entry the id list lives in (sharing
+-- its MAX_ITEMID/level fingerprint), so the first scan of each session loads the
+-- tally and skips the full pre-gate source walk -- see persistKillTally /
+-- loadPersistedKillTally in AffixFinderScan.lua. It is a kills-per-npc aggregate
+-- (not the item graph, not per-source rows), so it is cheap to persist.
 AF.killTallies = {}
 
 -- ---------------------------------------------------------------------------
@@ -67,7 +72,7 @@ AF.killTallies = {}
 --                    limited to after a change is detected (0 = rescan on every
 --                    detected change, the original behaviour).
 --   minSpawns      : default minimum reported mob spawn count for the Mobs view.
---   minDensity     : default minimum pack-density rank for the Mobs view
+--   minDensity     : default minimum farm-density rank for the Mobs view
 --                    (0 = any, 1 = fair+, 2 = good+, 3 = excellent only; see
 --                    AF.GetMobDensity / AF.DENSITY_GRADE_BY_RANK in
 --                    AffixFinderWarp.lua). Needs Questie spawn data; mobs with
@@ -76,7 +81,7 @@ AF.killTallies = {}
 --   automaticWarp  : T3-gated map-opening helper from the Mobs view. Enabled by
 --                    default; mob clicks still place the latest-target pin.
 --   scanBudget     : milliseconds of work per frame for the chunked scans
---                    (discovery, zone/resist/attune scans, pack density --
+--                    (discovery, zone/resist/attune scans, farm density --
 --                    they all run at this budget). Scan throughput is
 --                    budget x framerate, so this is the speed/smoothness
 --                    trade-off knob. Default 10 favours speed with mild
