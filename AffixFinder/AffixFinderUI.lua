@@ -64,7 +64,7 @@ end
 -- ---------------------------------------------------------------------------
 -- Layout constants
 -- ---------------------------------------------------------------------------
-local FRAME_W = 600
+local FRAME_W = 640
 -- Height before the tab block is laid out; UI.Build derives the real height
 -- from how many rows the tab bar wraps into.
 local FRAME_H = 588
@@ -74,7 +74,7 @@ local SCROLLBAR_W = 26          -- room reserved on the right for the scrollbar
 local LIST_W = INNER_W - SCROLLBAR_W
 local NUM_ROWS = 15
 local ROW_H = 22
-local MAX_COLS = 5
+local MAX_COLS = 6
 
 local TITLE_COLOR = { 0.49, 1.0, 0.83 }  -- the "|cff7fffd4" aquamarine of the addon
 
@@ -671,6 +671,20 @@ PANELS[#PANELS + 1] = {
 -- One row per NPC. Every column is a per-mob value (nothing is summed across
 -- mobs), so "Affixes left" is the remaining affixes across the items THIS mob
 -- drops, not a cross-mob zone total.
+-- Pull EV: the per-kill EV weighted by how many of this mob one AoE pull
+-- gathers (evPerKill x densest-pull count, x1000 to share the per-kill column's
+-- scale). 0 unless farm density is a CONFIDENT yard pull -- so percent-map
+-- fallbacks, too-few-points camps, and not-yet-computed mobs read 0. Sorting by
+-- this floats genuinely dense camps up and sinks unknown/sparse mobs to the
+-- bottom; the per-kill column still ranks every mob regardless of density.
+local function mobPullEV(e)
+    local camp = e.density and e.density.camp
+    if camp and camp.confident then
+        return num(e.evPerKill) * (camp.pullCount or 0) * 1000
+    end
+    return 0
+end
+
 PANELS[#PANELS + 1] = {
     id = "mobs",
     title = "Mobs",
@@ -681,35 +695,43 @@ PANELS[#PANELS + 1] = {
     -- until the user overrides it via the in-window box this session.
     minSpawns = 5,           -- hide the long tail of rare/sparse spawns by default
     columns = {
-        { title = "Mob", width = 168, justify = "LEFT",
+        { title = "Mob", width = 166, justify = "LEFT",
           value = function(e) return e.npcName or "?" end },
-        { title = "Zone", width = 150, justify = "LEFT",
+        { title = "Zone", width = 140, justify = "LEFT",
           value = function(e) return e.zoneName or "" end },
-        { title = "Drops/1k", width = 76, justify = "RIGHT", numeric = true,
+        { title = "Drops/1k", width = 72, justify = "RIGHT", numeric = true,
           headerTooltip = "Expected useful affix drops per 1000 kills of this mob: drop chance x (affixes left / possible affixes), summed over the items it drops.",
           value = function(e) return num(e.evPerKill) * 1000 end,
           text = function(e) return string.format("%.2f", num(e.evPerKill) * 1000) end },
-        { title = "Spawns", width = 64, justify = "RIGHT", numeric = true,
+        { title = "Pull EV", width = 72, justify = "RIGHT", numeric = true,
+          headerTooltip = "Expected useful affix drops per 1000 PULLS: Drops/1k x how many of this mob you gather in one AoE pull (farm density). 0 when density is unknown or sparse -- sort by this to rank mobs by what a pull actually yields.",
+          value = mobPullEV,
+          text = function(e) return string.format("%.2f", mobPullEV(e)) end },
+        { title = "Spawns", width = 66, justify = "RIGHT", numeric = true,
           headerTooltip = "Reported spawn count for this mob -- higher means a denser pack to farm. The Min spawns box hides mobs below its value.",
           value = function(e) return num(e.spawnedCount) end },
-        { title = "Items", width = 56, justify = "RIGHT", numeric = true,
+        { title = "Items", width = 60, justify = "RIGHT", numeric = true,
           headerTooltip = "Affixed items this mob drops that still have affixes left (a per-mob count -- nothing is summed across mobs).",
           value = function(e) return num(e.itemsDropped) end },
     },
     -- Same shape in attune mode; only the value column's meaning changes.
     attuneColumns = {
-        { title = "Mob", width = 168, justify = "LEFT",
+        { title = "Mob", width = 166, justify = "LEFT",
           value = function(e) return e.npcName or "?" end },
-        { title = "Zone", width = 150, justify = "LEFT",
+        { title = "Zone", width = 140, justify = "LEFT",
           value = function(e) return e.zoneName or "" end },
-        { title = "New/1k", width = 76, justify = "RIGHT", numeric = true,
+        { title = "New/1k", width = 72, justify = "RIGHT", numeric = true,
           headerTooltip = "Expected NEW item attunes per 1000 kills of this mob: the drop chances of the unattuned items it drops, summed. Every unattuned item counts once -- affix multiplicity is ignored in this mode.",
           value = function(e) return num(e.evPerKill) * 1000 end,
           text = function(e) return string.format("%.2f", num(e.evPerKill) * 1000) end },
-        { title = "Spawns", width = 64, justify = "RIGHT", numeric = true,
+        { title = "Pull EV", width = 72, justify = "RIGHT", numeric = true,
+          headerTooltip = "Expected NEW item attunes per 1000 PULLS: New/1k x how many of this mob you gather in one AoE pull (farm density). 0 when density is unknown or sparse -- sort by this to rank mobs by what a pull actually yields.",
+          value = mobPullEV,
+          text = function(e) return string.format("%.2f", mobPullEV(e)) end },
+        { title = "Spawns", width = 66, justify = "RIGHT", numeric = true,
           headerTooltip = "Reported spawn count for this mob -- higher means a denser pack to farm. The Min spawns box hides mobs below its value.",
           value = function(e) return num(e.spawnedCount) end },
-        { title = "Items", width = 56, justify = "RIGHT", numeric = true,
+        { title = "Items", width = 60, justify = "RIGHT", numeric = true,
           headerTooltip = "Items this mob drops that you have not attuned at all yet (no affix attuned, or a non-affixed item never attuned).",
           value = function(e) return num(e.itemsDropped) end },
     },
@@ -724,7 +746,8 @@ PANELS[#PANELS + 1] = {
                 if UI.frame and UI.frame:IsShown() then
                     UI.RefreshActivePanel()
                 end
-            end)
+            end, true)  -- quiet: the Pull EV column / filter warms density itself;
+                        -- the scan's PrefetchMobDensities already narrates the loud case
         end
         -- Mobs-only zone filter (case-insensitive substring on zoneName). The
         -- shared category/expansion pass in RefreshActivePanel still applies on
@@ -771,6 +794,7 @@ PANELS[#PANELS + 1] = {
             lines = {
                 { left = e.npcName or "?", right = e.zoneName },
                 { left = "  New item attunes / 1000 kills", right = string.format("%.2f", num(e.evPerKill) * 1000) },
+                { left = "  New item attunes / 1000 pulls", right = string.format("%.2f", mobPullEV(e)) },
                 { left = "  Reported spawn count", right = tostring(num(e.spawnedCount)) },
                 { left = "  Unattuned items it drops", right = tostring(num(e.itemsDropped)) },
                 { left = "  Each item counts once (affixes ignored in this mode)." },
@@ -779,6 +803,7 @@ PANELS[#PANELS + 1] = {
             lines = {
                 { left = e.npcName or "?", right = e.zoneName },
                 { left = "  Useful affix drops / 1000 kills", right = string.format("%.2f", num(e.evPerKill) * 1000) },
+                { left = "  Useful affix drops / 1000 pulls", right = string.format("%.2f", mobPullEV(e)) },
                 { left = "  Reported spawn count", right = tostring(num(e.spawnedCount)) },
                 { left = "  Affixed items it drops (with affixes left)", right = tostring(num(e.itemsDropped)) },
                 { left = "  Remaining affixes across those items", right = tostring(num(e.affixesLeft)) },

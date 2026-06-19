@@ -1824,8 +1824,11 @@ function AF.BuildMobList(data, minSpawns, classToken, minDensityRank)
     -- rather than kept: a strict filter means the user wants confirmed quality.
     -- Below it (fair+), unknown stays visible so missing data never empties the list.
     local STRICT_DENSITY_RANK = 2
-    local peekFn = (wantRank > 0) and type(AF.PeekMobDensity) == "function"
-        and AF.PeekMobDensity or nil
+    -- Always peek (a memo lookup, never a compute) even with no density filter:
+    -- every row carries its `density` so the Mobs panel's Pull EV column can
+    -- weight EV by pull size. Filtering by rank still only happens when wantRank
+    -- > 0; otherwise we just attach density and queue any unknowns to warm.
+    local peekFn = type(AF.PeekMobDensity) == "function" and AF.PeekMobDensity or nil
     -- N for the density grade = the spawn threshold, but floored at 5: with a
     -- tiny N the "pulls to gather N" grade collapses (gathering 2 never needs
     -- more than 2 pulls), so below 5 the qualitative bands stop meaning much.
@@ -1845,7 +1848,7 @@ function AF.BuildMobList(data, minSpawns, classToken, minDensityRank)
                     pending[#pending + 1] =
                         { npcId = mob.npcId, zoneName = mob.zoneName,
                           zoneId = mob.zoneId, campSize = campSize }
-                else
+                elseif wantRank > 0 then
                     local rank = density and (density.camp and density.camp.rank or density.rank)
                     if rank then
                         if rank < wantRank then
