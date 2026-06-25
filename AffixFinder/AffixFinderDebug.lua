@@ -19,6 +19,8 @@ local bitAnd = Scan.bitAnd
 local endTask = Scan.endTask
 local ensureAffixedIds = Scan.ensureAffixedIds
 local filterCaption = Scan.filterCaption
+local forEachMobItem = Scan.forEachMobItem
+local countMobItemEdges = Scan.countMobItemEdges
 local getAffixCounts = Scan.getAffixCounts
 local getAffixMasks = Scan.getAffixMasks
 local getCreatureSources = Scan.getCreatureSources
@@ -412,7 +414,7 @@ local function buildMobDiagnosis(data, mob)
     local includeMythics = data.includeMythics and true or false
     local items = {}
     local recomputedEv = 0
-    for itemId in pairs(mob.items or {}) do
+    forEachMobItem(data, mob, function(itemId)
         local value = affixedItemValue(itemId, data.scope, data.forgeFilter,
             data.bindFilter, includeMythics, false)
         local stats = mobSourceStats(itemId, mob.npcId, mob.zoneName)
@@ -432,7 +434,7 @@ local function buildMobDiagnosis(data, mob)
             maxChance = chance,
             gone = (value == nil) or (stats == nil),
         }
-    end
+    end)
     table.sort(items, function(a, b)
         if a.ev ~= b.ev then
             return a.ev > b.ev
@@ -478,18 +480,18 @@ local function buildMobDiagnosis(data, mob)
     diag.variants = {}
     local ownKey = normZoneKey(mob.zoneName)
     local ownItems = {}
-    for itemId in pairs(mob.items or {}) do
+    forEachMobItem(data, mob, function(itemId)
         ownItems[itemId] = true
-    end
+    end)
     for _, other in pairs(data.mobsByKey) do
         if other ~= mob and other.npcId == mob.npcId
             and normZoneKey(other.zoneName) == ownKey then
             local shared = 0
-            for itemId in pairs(other.items or {}) do
+            forEachMobItem(data, other, function(itemId)
                 if ownItems[itemId] then
                     shared = shared + 1
                 end
-            end
+            end)
             diag.variants[#diag.variants + 1] = {
                 zoneName = other.zoneName,
                 spawnedCount = other.spawnedCount,
@@ -1327,21 +1329,115 @@ local function printMemReport()
         local combos = 0
         local totalRows = 0
         local totalMobs = 0
+        local totalItems = 0
+        local totalEdges = 0
+        local totalEdgeBytes = 0
+        local classCaches = 0
+        local itemListRows = 0
         for _, data in pairs(store or {}) do
             combos = combos + 1
             totalRows = totalRows + #data.rows
             totalMobs = totalMobs + countEntries(data.mobsByKey)
+            totalItems = totalItems + countEntries(data.itemsById)
+            if data.__classProjection then
+                classCaches = classCaches + 1
+            end
+            if data.__itemListCache and data.__itemListCache.rows then
+                itemListRows = itemListRows + #data.__itemListCache.rows
+            end
+            totalEdges = totalEdges + (tonumber(data.itemEdgeCount) or 0)
+            for _, mob in pairs(data.mobsByKey or {}) do
+                if mob.itemEdgeBlob then
+                    totalEdgeBytes = totalEdgeBytes + #mob.itemEdgeBlob
+                end
+            end
+            if not data.itemEdgeCount then
+                for _, mob in pairs(data.mobsByKey or {}) do
+                    totalEdges = totalEdges + countMobItemEdges(mob)
+                end
+            end
         end
-        return combos, totalRows, totalMobs
+        return combos, totalRows, totalMobs, totalItems, totalEdges, totalEdgeBytes, classCaches, itemListRows
     end
-    local combos, totalRows, totalMobs = cacheSummary(AF.zoneData)
+    local combos, totalRows, totalMobs, totalItems, totalEdges, totalEdgeBytes, classCaches, itemListRows = cacheSummary(AF.zoneData)
     chat("Cached scope/forge/bind results: " .. combos
-        .. " (" .. totalRows .. " zone rows, " .. totalMobs .. " mob aggregates)")
-    combos, totalRows, totalMobs = cacheSummary(AF.attuneData)
+        .. " (" .. totalRows .. " zone rows, " .. totalMobs .. " mob aggregates, "
+        .. totalItems .. " item records, " .. totalEdges .. " mob-item edges, "
+        .. string.format("%.1f MB edge blobs", totalEdgeBytes / 1048576)
+        .. ", " .. classCaches .. " class caches, " .. itemListRows .. " cached item rows)")
+    combos, totalRows, totalMobs, totalItems, totalEdges, totalEdgeBytes, classCaches, itemListRows = cacheSummary(AF.attuneData)
     chat("Cached new-attunable results: " .. combos
-        .. " (" .. totalRows .. " zone rows, " .. totalMobs .. " mob aggregates)")
+        .. " (" .. totalRows .. " zone rows, " .. totalMobs .. " mob aggregates, "
+        .. totalItems .. " item records, " .. totalEdges .. " mob-item edges, "
+        .. string.format("%.1f MB edge blobs", totalEdgeBytes / 1048576)
+        .. ", " .. classCaches .. " class caches, " .. itemListRows .. " cached item rows)")
 end
 
+
+-- Dev/build helper: dump the set of npcIds whose density the addon could ever
+-- query -- every mob that drops an affixed OR attunable item, account scope,
+-- widest filters (these are the keys of killsByZoneNpc, value-gate-independent,
+-- which is exactly what BuildMobList/Instances can show). Writes a sorted id
+-- list to AffixFinderDB.dropperDump (no new SavedVariables line needed) so it
+-- survives logout into WTF/.../AffixFinder.lua, where tools/gen_bundle.lua can
+-- read it to cut the bundled spawn data down to the A-lean scope. Not shipped.
+local function printDropperDump(options)
+    if AF.busy then
+        chat("Busy: a scan is running. Try again in a moment.")
+        return
+    end
+    if type(AffixFinderDB) ~= "table" then
+        chat("AffixFinderDB unavailable -- cannot persist the dump.")
+        return
+    end
+    local scope = "account"
+    local ids = {}
+
+    local function collect(data)
+        if type(data) ~= "table" or type(data.killsByZoneNpc) ~= "table" then
+            return
+        end
+        for _, byNpc in pairs(data.killsByZoneNpc) do
+            for npcId in pairs(byNpc) do
+                ids[tonumber(npcId) or npcId] = true
+            end
+        end
+    end
+
+    local function finish()
+        local list = {}
+        for id in pairs(ids) do
+            list[#list + 1] = id
+        end
+        table.sort(list)
+        AffixFinderDB.dropperDump = list
+        chat(string.format(
+            "Dropper dump: %d distinct npcIds (affix + attune, account scope).",
+            #list))
+        chat("Saved to AffixFinderDB.dropperDump. Log out (or /reload) to flush it")
+        chat("to WTF/Account/<acct>/SavedVariables/AffixFinder.lua, then point")
+        chat("tools/gen_bundle.lua --droppers=<that file> at it for the A-lean cut.")
+    end
+
+    chat("Dropper dump: scanning affixed-item droppers (account scope)...")
+    AF.ComputeZoneData(scope, nil, nil, function(affixData, err)
+        if not affixData then
+            reportScanError(err, "dump droppers (affix)")
+            return
+        end
+        collect(affixData)
+        chat("Dropper dump: scanning attunable-item droppers...")
+        AF.ComputeAttuneData(scope, nil, nil, function(attuneData, err2)
+            if not attuneData then
+                -- Still emit what the affix scan found rather than nothing.
+                reportScanError(err2, "dump droppers (attune)")
+            else
+                collect(attuneData)
+            end
+            finish()
+        end)
+    end)
+end
 
 I.Debug = {
     buildMobDiagnosis = buildMobDiagnosis,  -- exported for the regression test
@@ -1357,4 +1453,5 @@ I.Debug = {
     printWarpDebug = printWarpDebug,
     printZoneClassification = printZoneClassification,
     printZoneItemDump = printZoneItemDump,
+    printDropperDump = printDropperDump,
 }

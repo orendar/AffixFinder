@@ -1081,6 +1081,31 @@ end
 -- the configured rescanInterval has elapsed since it was built (0 = always
 -- recompute), then dropped and rebuilt. A manual ClearAll removes the entry,
 -- bypassing the interval. This is the one place that policy lives.
+-- Keep only the most-recent N scope/forge/bind (or resist-element) slices
+-- resident PER store. Each slice is large (thousands of mob aggregates), and the
+-- store is keyed per filter combo with no other bound -- so exploring filters
+-- used to pile up a full slice each, forever. Evicted combos simply rescan on
+-- demand, which is cheap now that the kill tally is persisted. `__seq` stamps
+-- insertion order so the OLDEST combo is dropped (the active one is always newest).
+local SLICE_CACHE_MAX = 2
+local cacheSeq = 0
+local function pruneSliceStore(store)
+    local count = 0
+    for _ in pairs(store) do count = count + 1 end
+    while count > SLICE_CACHE_MAX do
+        local oldestKey, oldestSeq
+        for k, v in pairs(store) do
+            local seq = v.__seq or 0
+            if not oldestSeq or seq < oldestSeq then
+                oldestKey, oldestSeq = k, seq
+            end
+        end
+        if not oldestKey then break end
+        store[oldestKey] = nil
+        count = count - 1
+    end
+end
+
 local function computeWithCache(store, key, build, onComplete)
     onComplete = onComplete or function() end
 
@@ -1108,7 +1133,10 @@ local function computeWithCache(store, key, build, onComplete)
         if data then
             data.computedAt = time()
             data.dirty = false
+            cacheSeq = cacheSeq + 1
+            data.__seq = cacheSeq
             store[key] = data
+            pruneSliceStore(store)
         end
         onComplete(data, err)
     end
@@ -1257,8 +1285,8 @@ local function loadPersistedKillTally(which, ids)
     local cache = type(db) == "table" and db[killTallyCacheKey(which)]
     if type(cache) == "table" and cache.max == MAX_ITEMID
         and type(cache.kills) == "table" and type(cache.zoneIds) == "table" then
-        -- Bind to the id list we just loaded so the identity check in the scan
-        -- (tally.ids == ids) recognises it as built-for-this-list.
+        -- Bind to the loaded id list so the scan identity check
+        -- (tally.ids == ids) recognises the tally as built-for-this-list.
         AF.killTallies[which] = { ids = ids, kills = cache.kills, zoneIds = cache.zoneIds }
     end
 end
@@ -1398,14 +1426,12 @@ local function newZoneRow(zoneName)
             affixedItemsWithAffixesLeft = {},
             totalAffixesLeft = {},
         },
-        -- Account scope only: per-class sub-tallies (classToken -> tally with
-        -- the same shape as the top-level zone counts). Empty in character scope.
-        byClass = {},
     }
 end
 
--- One per-class zone tally, mirroring the top-level zone counts so the UI can
--- format a single class exactly like the account-wide view.
+-- One display-time class zone tally, mirroring the top-level zone counts so the
+-- UI can format a single class exactly like the account-wide view without
+-- storing a 10-class copy on every cached zone row.
 local function newClassZoneTally()
     return {
         unattunedAffixedItems = 0,
@@ -1417,6 +1443,250 @@ local function newClassZoneTally()
             totalAffixesLeft = {},
         },
     }
+end
+
+-- The full mob-item edge map is the largest resident structure on account
+-- slices: millions of hash entries in large accounts. During accumulation we
+-- keep the convenient table form, then compact each mob's itemId/dropChance
+-- pairs into a fixed-width binary string before caching the slice.
+--
+-- Layout per edge: 4-byte LE itemId + 2-byte LE chance (drop probability is
+-- 0..1, see getDropProbability, so a u16 fixed-point over EDGE_CHANCE_SCALE
+-- gives ~1.5e-5 resolution -- finer than any ranking or EV needs, and 25%
+-- smaller than carrying the chance as a u32). The precision floor means a
+-- drop chance below ~7.6e-6 (under 0.001%) quantizes to 0; such edges are
+-- farming noise and their EV contribution is negligible.
+local EDGE_BYTES = 6
+local EDGE_CHANCE_SCALE = 65535
+
+local function u32Bytes(n)
+    n = math.floor(tonumber(n) or 0)
+    if n < 0 then n = 0 end
+    local b1 = n % 256
+    n = (n - b1) / 256
+    local b2 = n % 256
+    n = (n - b2) / 256
+    local b3 = n % 256
+    n = (n - b3) / 256
+    local b4 = n % 256
+    return b1, b2, b3, b4
+end
+
+local function packMobItemEdge(itemId, dropProbability)
+    local p = math.floor(((tonumber(dropProbability) or 0) * EDGE_CHANCE_SCALE) + 0.5)
+    if p < 0 then p = 0 end
+    if p > EDGE_CHANCE_SCALE then p = EDGE_CHANCE_SCALE end
+    local i1, i2, i3, i4 = u32Bytes(itemId)
+    local p1 = p % 256
+    local p2 = (p - p1) / 256
+    return string.char(i1, i2, i3, i4, p1, p2)
+end
+
+local function unpackMobItemEdge(blob, offset)
+    local i1, i2, i3, i4, p1, p2 = string.byte(blob, offset, offset + EDGE_BYTES - 1)
+    local itemId = i1 + (i2 * 256) + (i3 * 65536) + (i4 * 16777216)
+    local chance = (p1 + (p2 * 256)) / EDGE_CHANCE_SCALE
+    return itemId, chance
+end
+
+local function compactOneMobItemEdges(mob)
+    if not mob then
+        return 0
+    end
+    if not mob.items then
+        return tonumber(mob.itemEdgeCount) or 0
+    end
+    -- Pack edges in ascending itemId order (not pairs() order). Mobs that share
+    -- the SAME loot table -- common on shared/variant spawns -- then serialize to
+    -- byte-identical blobs, which Lua interns to ONE shared string (free dedup),
+    -- and the blob is deterministic regardless of hash layout (nicer to diff and
+    -- a prerequisite for any future gap-encoding of the ids). No consumer relies
+    -- on edge order. Cost is one sort per mob, off-frame in the async compaction.
+    local ids = {}
+    local n = 0
+    for itemId in pairs(mob.items) do
+        n = n + 1
+        ids[n] = itemId
+    end
+    table.sort(ids)
+    local parts = {}
+    for i = 1, n do
+        local itemId = ids[i]
+        parts[i] = packMobItemEdge(itemId, mob.items[itemId])
+    end
+    mob.itemEdgeBlob = (n > 0) and table.concat(parts) or nil
+    mob.itemEdgeCount = n
+    mob.items = nil
+    return n
+end
+
+local function compactMobItemEdges(data)
+    local total = 0
+    for _, mob in pairs((data and data.mobsByKey) or {}) do
+        total = total + compactOneMobItemEdges(mob)
+    end
+    if data then
+        data.itemEdgeCount = total
+    end
+    return total
+end
+
+local function compactMobItemEdgesAsync(data, doneFn)
+    doneFn = doneFn or function() end
+    local mobs = {}
+    for _, mob in pairs((data and data.mobsByKey) or {}) do
+        mobs[#mobs + 1] = mob
+    end
+    local total = 0
+    runChunked(#mobs, function(i)
+        total = total + compactOneMobItemEdges(mobs[i])
+    end, function()
+        if data then
+            data.itemEdgeCount = total
+        end
+        doneFn(data)
+    end)
+end
+
+local function forEachMobItem(data, mob, fn)
+    if not mob then return end
+    if mob.items then
+        for itemId, dropProbability in pairs(mob.items) do
+            fn(itemId, dropProbability)
+        end
+        return
+    end
+    local blob = mob.itemEdgeBlob
+    if not blob then return end
+    for offset = 1, #blob, EDGE_BYTES do
+        local itemId, dropProbability = unpackMobItemEdge(blob, offset)
+        fn(itemId, dropProbability)
+    end
+end
+
+local function countMobItemEdges(mob)
+    if not mob then return 0 end
+    if mob.items then
+        local n = 0
+        for _ in pairs(mob.items) do n = n + 1 end
+        return n
+    end
+    return tonumber(mob.itemEdgeCount) or 0
+end
+
+local function classMatchesItem(rec, classToken)
+    return (not classToken) or (rec and rec.classes and rec.classes[classToken])
+end
+
+local function addItemToZoneTally(tally, rec)
+    tally.candidateItems = (tally.candidateItems or 0) + 1
+    local category = rec.category
+    local affixesLeft = tonumber(rec.affixesLeft) or 0
+    if rec.unattuned then
+        tally.unattunedAffixedItems = tally.unattunedAffixedItems + 1
+        addBreakdownCount(tally.breakdown.unattunedAffixedItems, category, 1)
+    end
+    if affixesLeft > 0 then
+        tally.affixedItemsWithAffixesLeft = tally.affixedItemsWithAffixesLeft + 1
+        tally.totalAffixesLeft = tally.totalAffixesLeft + affixesLeft
+        addBreakdownCount(tally.breakdown.affixedItemsWithAffixesLeft, category, 1)
+        addBreakdownCount(tally.breakdown.totalAffixesLeft, category, affixesLeft)
+    end
+end
+
+local function itemValuePerDrop(rec)
+    local possible = tonumber(rec and rec.possible) or 0
+    if possible <= 0 then
+        return 0
+    end
+    return (tonumber(rec.affixesLeft) or 0) / possible
+end
+
+local function buildClassProjection(data, classToken)
+    local itemsById = data and data.itemsById or {}
+    local rowsByZone, rows = {}, {}
+    local seenByZone = {}
+    local mobTallies = {}
+    for _, mob in pairs((data and data.mobsByKey) or {}) do
+        local zoneName = mob.zoneName
+        local evPerKill, itemsDropped, affixesLeft = 0, 0, 0
+        if zoneName then
+            local seen = seenByZone[zoneName]
+            if not seen then
+                seen = {}
+                seenByZone[zoneName] = seen
+            end
+            forEachMobItem(data, mob, function(itemId, dropProbability)
+                local rec = itemsById[itemId]
+                local left = tonumber(rec and rec.affixesLeft) or 0
+                if left > 0 and classMatchesItem(rec, classToken) then
+                    if not seen[itemId] then
+                        seen[itemId] = true
+                        local row = rowsByZone[zoneName]
+                        if not row then
+                            row = newClassZoneTally()
+                            row.zoneName = zoneName
+                            rowsByZone[zoneName] = row
+                            rows[#rows + 1] = row
+                        end
+                        addItemToZoneTally(row, rec)
+                    end
+                    evPerKill = evPerKill
+                        + ((tonumber(dropProbability) or 0)
+                            * (tonumber(data and data.forgeDropChance) or 1)
+                            * itemValuePerDrop(rec))
+                    itemsDropped = itemsDropped + 1
+                    affixesLeft = affixesLeft + left
+                end
+            end)
+        end
+        if affixesLeft > 0 then
+            mobTallies[mob] = {
+                evPerKill = evPerKill,
+                itemsDropped = itemsDropped,
+                affixesLeft = affixesLeft,
+            }
+        end
+    end
+    return { classToken = classToken, rows = rows, rowsByZone = rowsByZone, mobTallies = mobTallies }
+end
+
+local function getClassProjection(data, classToken)
+    if not classToken then
+        return nil
+    end
+    local cached = data and data.__classProjection
+    if cached and cached.classToken == classToken then
+        return cached
+    end
+    -- One projection resident at a time: switching class drops the prior one.
+    -- Bounded with the slice itself (SLICE_CACHE_MAX slices, one projection each).
+    local projection = buildClassProjection(data, classToken)
+    if data then
+        data.__classProjection = projection
+    end
+    return projection
+end
+
+-- Builds one class's per-zone rows from the retained item edge map. This is the
+-- display-time replacement for the former resident row.byClass graph. Items are
+-- counted once per distinct zone, matching accumulateAffix/accumulateAttune.
+local function buildClassZoneRows(data, classToken)
+    local projection = getClassProjection(data, classToken)
+    if projection then
+        return projection.rows, projection.rowsByZone
+    end
+    return {}, {}
+end
+
+-- Builds one class's per-mob tally from mob.items + itemsById. This keeps the
+-- cached mob record lean while preserving prior class-filtered EV semantics.
+local function buildClassMobTally(data, mob, classToken)
+    if not classToken then
+        return mob
+    end
+    local projection = getClassProjection(data, classToken)
+    return projection and projection.mobTallies[mob] or nil
 end
 
 local function scopeForgeKey(scope, forgeFilter, bindFilter, includeMythics)
@@ -1507,26 +1777,6 @@ local function accumulateAffix(ctx, itemId, value, sources)
                 addBreakdownCount(row.breakdown.totalAffixesLeft, category, affixesLeft)
             end
 
-            -- Mirror the same counts into each class this item is for.
-            if classes then
-                for c in pairs(classes) do
-                    local ct = row.byClass[c]
-                    if not ct then
-                        ct = newClassZoneTally()
-                        row.byClass[c] = ct
-                    end
-                    if unattuned then
-                        ct.unattunedAffixedItems = ct.unattunedAffixedItems + 1
-                        addBreakdownCount(ct.breakdown.unattunedAffixedItems, category, 1)
-                    end
-                    if affixesLeft > 0 then
-                        ct.affixedItemsWithAffixesLeft = ct.affixedItemsWithAffixesLeft + 1
-                        ct.totalAffixesLeft = ct.totalAffixesLeft + affixesLeft
-                        addBreakdownCount(ct.breakdown.affixedItemsWithAffixesLeft, category, 1)
-                        addBreakdownCount(ct.breakdown.totalAffixesLeft, category, affixesLeft)
-                    end
-                end
-            end
         end
 
         -- Per-mob EV (only meaningful while affixes remain).
@@ -1545,7 +1795,6 @@ local function accumulateAffix(ctx, itemId, value, sources)
                     itemsDropped = 0,
                     affixesLeft = 0,
                     items = {},
-                    byClass = {},
                 }
                 mobsByKey[mobKey] = mob
             end
@@ -1559,19 +1808,6 @@ local function accumulateAffix(ctx, itemId, value, sources)
             end
             if not mob.zoneId then
                 mob.zoneId = src.zoneId
-            end
-
-            if classes then
-                for c in pairs(classes) do
-                    local mc = mob.byClass[c]
-                    if not mc then
-                        mc = { evPerKill = 0, itemsDropped = 0, affixesLeft = 0 }
-                        mob.byClass[c] = mc
-                    end
-                    mc.evPerKill = mc.evPerKill + evDelta
-                    mc.itemsDropped = mc.itemsDropped + 1
-                    mc.affixesLeft = mc.affixesLeft + affixesLeft
-                end
             end
         end
     end
@@ -1670,7 +1906,7 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
             if building then
                 commitAffixTally(ids, killsByZoneNpc, zoneIdsByName)
             end
-            finish({
+            local data = {
                 scope = scope,
                 forgeFilter = forgeFilter,
                 bindFilter = bindFilter,
@@ -1686,7 +1922,8 @@ function AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
                 killsByZoneNpc = killsByZoneNpc,
                 zoneIdsByName = zoneIdsByName,
                 affixedItemsScanned = ctx.scanned,
-            })
+            }
+            compactMobItemEdgesAsync(data, finish)
         end, progress)
     end)
     end, onComplete)
@@ -1728,6 +1965,26 @@ function AF.FindZoneRow(data, zoneName)
 end
 local findZoneRow = AF.FindZoneRow
 
+-- Same lookup, but when a class is selected it returns a display-time projected
+-- tally instead of reading a resident row.byClass table.
+function AF.FindClassZoneRow(data, zoneName, classToken)
+    if not classToken then
+        return AF.FindZoneRow(data, zoneName)
+    end
+    local _, rowsByZone = buildClassZoneRows(data, classToken)
+    local row = rowsByZone[zoneName]
+    if row then
+        return row
+    end
+    local lowered = string.lower(zoneName)
+    for name, candidate in pairs(rowsByZone) do
+        if string.lower(name) == lowered then
+            return candidate
+        end
+    end
+    return nil
+end
+
 -- ", BoP" / ", BoE" / "" for captions. Exposed so the UI labels identically.
 local BIND_LABELS = { bop = "BoP", boe = "BoE" }
 function AF.BindLabel(bindFilter)
@@ -1752,23 +2009,16 @@ end
 -- command and the UI so both rank identically.
 --
 -- classToken (optional, account scope) restricts the numbers to a single class:
--- each emitted row carries that class's sub-tallies under the same field names,
--- and zones with nothing left for that class are dropped. nil = account totals.
+-- rows are projected at display time from itemsById + mob.items, and zones with
+-- nothing left for that class are dropped. nil = account totals.
 function AF.BuildZoneRankings(data, classToken)
     local rows = {}
-    for _, row in ipairs(data.rows) do
-        if classToken then
-            local ct = row.byClass and row.byClass[classToken]
-            if ct and ct.totalAffixesLeft > 0 then
-                rows[#rows + 1] = {
-                    zoneName = row.zoneName,
-                    totalAffixesLeft = ct.totalAffixesLeft,
-                    affixedItemsWithAffixesLeft = ct.affixedItemsWithAffixesLeft,
-                    unattunedAffixedItems = ct.unattunedAffixedItems,
-                    breakdown = ct.breakdown,
-                }
-            end
-        elseif row.totalAffixesLeft > 0 then
+    local sourceRows = data.rows
+    if classToken then
+        sourceRows = buildClassZoneRows(data, classToken)
+    end
+    for _, row in ipairs(sourceRows or {}) do
+        if row.totalAffixesLeft > 0 then
             rows[#rows + 1] = row
         end
     end
@@ -1827,7 +2077,7 @@ function AF.BuildMobList(data, minSpawns, classToken, minDensityRank)
     -- Always peek (a memo lookup, never a compute) even with no density filter:
     -- every row carries its `density` so the Mobs panel's Pull EV column can
     -- weight EV by pull size. Filtering by rank still only happens when wantRank
-    -- > 0; otherwise we just attach density and queue any unknowns to warm.
+    -- > 0; otherwise attach density and queue any unknowns to warm.
     local peekFn = type(AF.PeekMobDensity) == "function" and AF.PeekMobDensity or nil
     -- N for the density grade = the spawn threshold, but floored at 5: with a
     -- tiny N the "pulls to gather N" grade collapses (gathering 2 never needs
@@ -1864,7 +2114,7 @@ function AF.BuildMobList(data, minSpawns, classToken, minDensityRank)
                 end
             end
             if densityPass and classToken then
-                local mc = mob.byClass and mob.byClass[classToken]
+                local mc = buildClassMobTally(data, mob, classToken)
                 if mc and mc.affixesLeft > 0 then
                     mobs[#mobs + 1] = {
                         zoneName = mob.zoneName,
@@ -1896,27 +2146,54 @@ end
 -- Ranks the classes by how much affix value the account can still attune on
 -- them (account scope only), summed over the zones that pass zonePassFn (the
 -- UI's display-time category/expansion filter), so the ranking respects the
--- same filters as the other panels. zonePassFn(zoneName) -> bool; pass nil to
+-- same filters as the other panels. Derived from item class membership instead
+-- of a resident per-class graph. zonePassFn(zoneName) -> bool; pass nil to
 -- include every zone. Returns an array sorted by remaining affixes, best-first.
-function AF.BuildClassRankings(data, zonePassFn)
+--
+-- This walks every mob's edges, so the Class tab would otherwise repeat it on
+-- every repaint. cacheKey (optional) is a signature of the zonePassFn's filter
+-- state from the caller; when it matches the last build, the rows are reused.
+-- nil disables the memo (chat/test callers that don't thread a key).
+function AF.BuildClassRankings(data, zonePassFn, cacheKey)
+    if data and cacheKey ~= nil then
+        local cached = data.__classRankCache
+        if cached and cached.key == cacheKey then
+            return cached.rows
+        end
+    end
     local totals = {}
-    for _, row in ipairs(data.rows) do
-        if (not zonePassFn) or zonePassFn(row.zoneName) then
-            if row.byClass then
-                for token, ct in pairs(row.byClass) do
-                    if ct.totalAffixesLeft > 0 then
-                        local t = totals[token]
-                        if not t then
-                            t = { classToken = token, totalAffixesLeft = 0,
-                                  affixedItemsWithAffixesLeft = 0, unattunedAffixedItems = 0 }
-                            totals[token] = t
+    local itemsById = data and data.itemsById or {}
+    local seenByZone = {}
+    for _, mob in pairs((data and data.mobsByKey) or {}) do
+        local zoneName = mob.zoneName
+        if zoneName and ((not zonePassFn) or zonePassFn(zoneName)) then
+            local seen = seenByZone[zoneName]
+            if not seen then
+                seen = {}
+                seenByZone[zoneName] = seen
+            end
+            forEachMobItem(data, mob, function(itemId)
+                if not seen[itemId] then
+                    local rec = itemsById[itemId]
+                    local left = tonumber(rec and rec.affixesLeft) or 0
+                    if left > 0 and rec.classes then
+                        seen[itemId] = true
+                        for token in pairs(rec.classes) do
+                            local t = totals[token]
+                            if not t then
+                                t = { classToken = token, totalAffixesLeft = 0,
+                                      affixedItemsWithAffixesLeft = 0, unattunedAffixedItems = 0 }
+                                totals[token] = t
+                            end
+                            t.totalAffixesLeft = t.totalAffixesLeft + left
+                            t.affixedItemsWithAffixesLeft = t.affixedItemsWithAffixesLeft + 1
+                            if rec.unattuned then
+                                t.unattunedAffixedItems = t.unattunedAffixedItems + 1
+                            end
                         end
-                        t.totalAffixesLeft = t.totalAffixesLeft + ct.totalAffixesLeft
-                        t.affixedItemsWithAffixesLeft = t.affixedItemsWithAffixesLeft + ct.affixedItemsWithAffixesLeft
-                        t.unattunedAffixedItems = t.unattunedAffixedItems + ct.unattunedAffixedItems
                     end
                 end
-            end
+            end)
         end
     end
 
@@ -1931,6 +2208,9 @@ function AF.BuildClassRankings(data, zonePassFn)
         end
         return tostring(a.className or "") < tostring(b.className or "")
     end)
+    if data and cacheKey ~= nil then
+        data.__classRankCache = { key = cacheKey, rows = rows }
+    end
     return rows
 end
 
@@ -1949,13 +2229,18 @@ function AF.BuildItemList(data, minSpawns, classToken, zoneNeedle)
         minSpawns = 0
     end
     local needle = (type(zoneNeedle) == "string" and zoneNeedle ~= "") and string.lower(zoneNeedle) or nil
+    local cacheKey = tostring(minSpawns) .. ":" .. tostring(classToken or "") .. ":" .. tostring(needle or "")
+    local cached = data.__itemListCache
+    if cached and cached.key == cacheKey then
+        return cached.rows
+    end
     local itemsById = data.itemsById or {}
     local seen = {}
     local rows = {}
     for _, mob in pairs(data.mobsByKey) do
-        if mob.items and mob.spawnedCount >= minSpawns
+        if mob.spawnedCount >= minSpawns
             and (not needle or (mob.zoneName and string.find(string.lower(mob.zoneName), needle, 1, true))) then
-            for itemId, dropProbability in pairs(mob.items) do
+            forEachMobItem(data, mob, function(itemId, dropProbability)
                 local rec = itemsById[itemId]
                 if rec and rec.affixesLeft > 0
                     and ((not classToken) or (rec.classes and rec.classes[classToken])) then
@@ -1989,7 +2274,7 @@ function AF.BuildItemList(data, minSpawns, classToken, zoneNeedle)
                         r.bestMobDropProbability = dropProbability
                     end
                 end
-            end
+            end)
         end
     end
     table.sort(rows, function(a, b)
@@ -1998,6 +2283,9 @@ function AF.BuildItemList(data, minSpawns, classToken, zoneNeedle)
         end
         return (a.itemId or 0) < (b.itemId or 0)
     end)
+    -- One item-list result resident at a time (keyed by minSpawns/class/needle),
+    -- bounded with the slice itself.
+    data.__itemListCache = { key = cacheKey, rows = rows }
     return rows
 end
 
@@ -2015,11 +2303,15 @@ function AF.BuildExpansionBreakdown(data, zonePassFn, classToken)
             unattunedAffixedItems = 0, zones = 0,
         }
     end
+    local classRowsByZone
+    if classToken then
+        _, classRowsByZone = buildClassZoneRows(data, classToken)
+    end
     for _, row in ipairs(data.rows) do
         if (not zonePassFn) or zonePassFn(row.zoneName) then
             local src = row
             if classToken then
-                src = row.byClass and row.byClass[classToken]
+                src = classRowsByZone and classRowsByZone[row.zoneName]
             end
             if src and src.totalAffixesLeft > 0 then
                 local _, exp = AF.ClassifyZone(row.zoneName)
@@ -2183,10 +2475,10 @@ end
 --                    { npcName, npcId, spawnedCount, evShare } for the "why is
 --                    this ranked #1" tooltip.
 --
--- classToken (account scope) takes each mob's EV/affix tallies from byClass,
--- but killsPerClear is class-independent: a clear kills the whole instance
--- regardless of who the loot is for. Instances with no EV left for the class
--- are dropped.
+-- classToken (account scope) projects each mob's EV/affix tallies from
+-- itemsById + mob.items, but killsPerClear is class-independent: a clear kills
+-- the whole instance regardless of who the loot is for. Instances with no EV
+-- left for the class are dropped.
 --
 -- No minSpawns: the premise is "you kill everything anyway", so hiding sparse
 -- mobs would only understate an instance.
@@ -2293,7 +2585,7 @@ function AF.BuildInstanceRankings(data, classToken)
             end
             local tally = mob
             if classToken then
-                tally = mob.byClass and mob.byClass[classToken]
+                tally = buildClassMobTally(data, mob, classToken)
             end
             if tally and tally.evPerKill > 0 then
                 local evShare = spawns * tally.evPerKill
@@ -2386,7 +2678,10 @@ I.Scan = {
     commitAttuneTally = commitAttuneTally,
     bestCreatureSource = bestCreatureSource,
     bitAnd = bitAnd,
+    compactMobItemEdges = compactMobItemEdges,
+    compactMobItemEdgesAsync = compactMobItemEdgesAsync,
     computeWithCache = computeWithCache,
+    countMobItemEdges = countMobItemEdges,
     countBits32 = countBits32,
     endTask = endTask,
     ensureAffixedIds = ensureAffixedIds,
@@ -2395,6 +2690,7 @@ I.Scan = {
     filterCaption = filterCaption,
     findZoneRow = findZoneRow,
     foldSourcesIntoTally = foldSourcesIntoTally,
+    forEachMobItem = forEachMobItem,
     getAffixCounts = getAffixCounts,
     getAffixMasks = getAffixMasks,
     getCreatureSources = getCreatureSources,

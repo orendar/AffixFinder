@@ -13,6 +13,8 @@ local affixedItemValue = Scan.affixedItemValue
 local bestCreatureSource = Scan.bestCreatureSource
 local commitAffixTally = Scan.commitAffixTally
 local commitAttuneTally = Scan.commitAttuneTally
+local compactMobItemEdges = Scan.compactMobItemEdges
+local compactMobItemEdgesAsync = Scan.compactMobItemEdgesAsync
 local computeWithCache = Scan.computeWithCache
 local ensureAffixedIds = Scan.ensureAffixedIds
 local ensureAttunableIds = Scan.ensureAttunableIds
@@ -24,7 +26,6 @@ local itemIsUnattuned = Scan.itemIsUnattuned
 local itemMatchesScope = Scan.itemMatchesScope
 local itemPassesTagFilters = Scan.itemPassesTagFilters
 local makeProgress = Scan.makeProgress
-local newClassZoneTally = Scan.newClassZoneTally
 local newZoneRow = Scan.newZoneRow
 local runChunked = Scan.runChunked
 local scopeForgeKey = Scan.scopeForgeKey
@@ -137,22 +138,6 @@ local function accumulateAttune(ctx, itemId, value, sources)
             addBreakdownCount(row.breakdown.unattunedAffixedItems, category, 1)
             addBreakdownCount(row.breakdown.affixedItemsWithAffixesLeft, category, 1)
             addBreakdownCount(row.breakdown.totalAffixesLeft, category, 1)
-
-            if classes then
-                for c in pairs(classes) do
-                    local ct = row.byClass[c]
-                    if not ct then
-                        ct = newClassZoneTally()
-                        row.byClass[c] = ct
-                    end
-                    ct.unattunedAffixedItems = ct.unattunedAffixedItems + 1
-                    ct.affixedItemsWithAffixesLeft = ct.affixedItemsWithAffixesLeft + 1
-                    ct.totalAffixesLeft = ct.totalAffixesLeft + 1
-                    addBreakdownCount(ct.breakdown.unattunedAffixedItems, category, 1)
-                    addBreakdownCount(ct.breakdown.affixedItemsWithAffixesLeft, category, 1)
-                    addBreakdownCount(ct.breakdown.totalAffixesLeft, category, 1)
-                end
-            end
         end
 
         local npcId = src.npcId
@@ -170,7 +155,6 @@ local function accumulateAttune(ctx, itemId, value, sources)
                 -- itemId -> drop probability; shared item builders use the
                 -- chance to choose the best source for each item.
                 items = {},
-                byClass = {},
             }
             mobsByKey[mobKey] = mob
         end
@@ -184,19 +168,6 @@ local function accumulateAttune(ctx, itemId, value, sources)
         mob.items[itemId] = src.dropProbability
         if src.spawnedCount > mob.spawnedCount then
             mob.spawnedCount = src.spawnedCount
-        end
-
-        if classes then
-            for c in pairs(classes) do
-                local mc = mob.byClass[c]
-                if not mc then
-                    mc = { evPerKill = 0, itemsDropped = 0, affixesLeft = 0 }
-                    mob.byClass[c] = mc
-                end
-                mc.evPerKill = mc.evPerKill + evDelta
-                mc.itemsDropped = mc.itemsDropped + 1
-                mc.affixesLeft = mc.affixesLeft + 1
-            end
         end
     end
 end
@@ -277,7 +248,7 @@ function AF.ComputeAttuneData(scope, forgeFilter, bindFilter, onComplete)
             if building then
                 commitAttuneTally(ids, killsByZoneNpc, zoneIdsByName)
             end
-            finish({
+            local data = {
                 mode = "attune",
                 scope = scope,
                 forgeFilter = forgeFilter,
@@ -292,7 +263,8 @@ function AF.ComputeAttuneData(scope, forgeFilter, bindFilter, onComplete)
                 killsByZoneNpc = killsByZoneNpc,
                 zoneIdsByName = zoneIdsByName,
                 affixedItemsScanned = ctx.scanned,
-            })
+            }
+            compactMobItemEdgesAsync(data, finish)
         end, progress)
     end)
     end, onComplete)
@@ -351,12 +323,15 @@ local function finishSlice(ctx, extra)
     for k, v in pairs(extra) do
         data[k] = v
     end
+    compactMobItemEdges(data)
     return data
 end
 
 -- Walks the union of the affixed + attunable id lists once, folding each item's
 -- sources into both slices. Calls cb(affixData, attuneData) or cb(nil, nil, err).
--- Only ever invoked when BOTH slices are wanted (see AF.ComputeFarmData).
+-- CURRENTLY UNUSED: AF.ComputeFarmData now builds a single mode at a time to keep
+-- only one slice resident. Retained (with unionMembership/newSliceCtx/finishSlice)
+-- as the basis for an optional "warm both modes" path; prune if that never lands.
 local function runCombinedWalk(scope, forgeFilter, bindFilter, includeMythics, cb)
     ensureAffixedIds(function(affixIds, errA)
         if not affixIds then cb(nil, nil, errA); return end
@@ -447,53 +422,29 @@ local function runCombinedWalk(scope, forgeFilter, bindFilter, includeMythics, c
     end)
 end
 
--- The entry point the UI's shared panels use. Builds the requested mode's slice,
--- and -- when the OTHER mode's slice is COLD (never built for this filter) --
--- builds it too in the SAME source walk, so flipping Find mode is instant. The
--- requested slice still goes through the normal cache/busy/dirty policy
--- (computeWithCache); the piggybacked slice is built only when absent, never
--- overriding a dirtied one (that refreshes on its own next request, cheap via
--- the persisted tally). `mode` is "affix" or "attune".
+-- The entry point the UI's shared panels use. Builds ONLY the requested mode's
+-- slice, through the normal cache/busy/dirty policy (computeWithCache, inside
+-- the single-mode scan). The inactive Find mode is built lazily on its OWN first
+-- request -- still cheap via the persisted kill tally. (It used to eagerly build
+-- the other mode's slice in the same source walk so flipping Find mode was
+-- instant, but holding BOTH slices resident roughly doubled the cached footprint
+-- -- e.g. ~6.9k affix + ~5.5k attune mob aggregates on a large account -- for a
+-- mode often never viewed. Memory won out over instant flips.) `mode` is
+-- "affix" or "attune". `runCombinedWalk` below builds both in one source walk and
+-- is currently UNUSED -- retained as the basis for an optional warm-both mode.
 function AF.ComputeFarmData(mode, scope, forgeFilter, bindFilter, onComplete)
-    onComplete = onComplete or function() end
-    local includeMythics = AF.GetConfig("includeMythics") and true or false
-    local key = scopeForgeKey(scope, forgeFilter, bindFilter, includeMythics)
-
-    local primaryStore = (mode == "attune") and AF.attuneData or AF.zoneData
-    local otherStore   = (mode == "attune") and AF.zoneData or AF.attuneData
-
-    -- Piggyback only when the other slice has never been built for this filter;
-    -- otherwise fall back to the plain single-mode compute (still fast via the
-    -- persisted/in-memory tally).
-    if otherStore[key] ~= nil then
-        if mode == "attune" then
-            AF.ComputeAttuneData(scope, forgeFilter, bindFilter, onComplete)
-        else
-            AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
-        end
-        return
+    -- One mode resident at a time: drop the slices of the mode we are leaving, so
+    -- toggling Find mode does not re-accumulate BOTH stores (they are separate, so
+    -- without this each mode's slice would persist once built). The dropped mode
+    -- rebuilds on demand, cheap via the persisted tally. Same reassign idiom as
+    -- AF.ClearAll; the UI holds the returned slice, never the store.
+    if mode == "attune" then
+        if next(AF.zoneData) then AF.zoneData = {} end
+        AF.ComputeAttuneData(scope, forgeFilter, bindFilter, onComplete)
+    else
+        if next(AF.attuneData) then AF.attuneData = {} end
+        AF.ComputeZoneData(scope, forgeFilter, bindFilter, onComplete)
     end
-
-    computeWithCache(primaryStore, key, function(finish)
-        runCombinedWalk(scope, forgeFilter, bindFilter, includeMythics,
-            function(affixData, attuneData, err)
-                if err then
-                    finish(nil, err)
-                    return
-                end
-                local primaryData = (mode == "attune") and attuneData or affixData
-                local otherData   = (mode == "attune") and affixData or attuneData
-                -- Stamp + store the piggybacked slice (computeWithCache stamps
-                -- the primary). Re-check it is still empty: the busy guard makes
-                -- this the norm, but never clobber a slice another path filled.
-                if otherData and otherStore[key] == nil then
-                    otherData.computedAt = time()
-                    otherData.dirty = false
-                    otherStore[key] = otherData
-                end
-                finish(primaryData)
-            end)
-    end, onComplete)
 end
 
 -- On-demand whole-item attunement snapshot for ONE item (no stored state) --

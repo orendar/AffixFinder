@@ -277,7 +277,6 @@ function AF.ComputeResistData(scope, element, onComplete)
                         evPerKill = 0,
                         itemsDropped = 0,
                         affixesLeft = 0,
-                        byClass = {},
                     }
                     mobsByKey[mobKey] = mob
                 end

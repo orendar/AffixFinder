@@ -26,6 +26,7 @@ local printWarpDebug = Debug.printWarpDebug
 local printMobDebug = Debug.printMobDebug
 local printForgeDebug = Debug.printForgeDebug
 local printMemReport = Debug.printMemReport
+local printDropperDump = Debug.printDropperDump
 
 -- ---------------------------------------------------------------------------
 -- Command handling
@@ -84,6 +85,8 @@ local function parseOptions(msg)
             options.mode = "mobdbg"
         elseif token == "forgedbg" or token == "forgepower" or token == "fp" then
             options.mode = "forgedbg"
+        elseif token == "dumpdroppers" or token == "dropperdump" then
+            options.mode = "dumpdroppers"
         elseif token == "affixdbg" or token == "maskdbg" then
             options.mode = "affixdbg"
             options.affixDbg = true
@@ -265,6 +268,8 @@ SlashCmdList["AFFIXFINDER"] = function(msg)
         printWarpDebug()
     elseif options.mode == "forgedbg" then
         printForgeDebug()
+    elseif options.mode == "dumpdroppers" then
+        printDropperDump(options)
     elseif options.mode == "instances" then
         printInstanceRankings(options)
     elseif options.mode == "zones" and options.ev then

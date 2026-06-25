@@ -93,6 +93,13 @@ local function questieAreaName(zoneDb, areaId)
             return entry[1]
         end
     end
+    -- Dependency-free fallback: bundled dungeon container names.
+    if I.SpawnDB then
+        local bundled = I.SpawnDB.dungeonName(areaId)
+        if bundled and bundled ~= "" then
+            return bundled
+        end
+    end
     return name
 end
 
@@ -230,18 +237,51 @@ end
 
 local function getQuestieNpcSpawns(npcId)
     local db = importQuestieDB()
-    if type(db) ~= "table" then
-        return nil
-    end
     local spawns
-    if type(db.QueryNPCSingle) == "function" then
-        spawns = safeFirst(db.QueryNPCSingle, npcId, "spawns")
+    if type(db) == "table" then
+        if type(db.QueryNPCSingle) == "function" then
+            spawns = safeFirst(db.QueryNPCSingle, npcId, "spawns")
+        end
+        if not spawns and type(db.GetNPC) == "function" then
+            local npc = safeFirst(db.GetNPC, db, npcId)
+            spawns = npc and npc.spawns
+        end
     end
-    if not spawns and type(db.GetNPC) == "function" then
-        local npc = safeFirst(db.GetNPC, db, npcId)
-        spawns = npc and npc.spawns
+    -- Dependency-free fallback: bundled spawn data when Questie is absent.
+    if not spawns and I.SpawnDB then
+        spawns = I.SpawnDB.npcSpawns(npcId)
     end
     return spawns
+end
+
+-- The UiMapData yard-scale table: Questie's when loaded, else the bundle. Both
+-- carry the same {width,height,left,top,instance,name} rows, so every reader
+-- below is source-agnostic.
+local function getUiMapData()
+    local compat = rawget(_G, "QuestieCompat")
+    local mapData = type(compat) == "table" and compat.UiMapData
+    if type(mapData) == "table" then
+        return mapData
+    end
+    return I.SpawnDB and I.SpawnDB.uiMapData() or nil
+end
+
+-- Convert a 0-1 map point to world yards via Questie's HBD when present, else
+-- the bundled reimplementation (identical arithmetic). Returns safeCall-style
+-- (ok, worldX, worldY, instanceId) so callers handle both paths uniformly.
+local function worldFromZone(x01, y01, uiMapId)
+    local compat = rawget(_G, "QuestieCompat")
+    local hbd = type(compat) == "table" and compat.HBD
+    if type(hbd) == "table" and type(hbd.GetWorldCoordinatesFromZone) == "function" then
+        return safeCall(hbd.GetWorldCoordinatesFromZone, hbd, x01, y01, uiMapId)
+    end
+    if I.SpawnDB then
+        local x, y, instance = I.SpawnDB.worldFromZone(x01, y01, uiMapId)
+        if x and y then
+            return true, x, y, instance
+        end
+    end
+    return false
 end
 
 local function getQuestieMobCoordinates(entry)
@@ -259,8 +299,7 @@ local function buildUiMapIndex()
     if uiMapIndex then
         return uiMapIndex
     end
-    local compat = rawget(_G, "QuestieCompat")
-    local mapData = type(compat) == "table" and compat.UiMapData
+    local mapData = getUiMapData()
     if type(mapData) ~= "table" then
         return nil
     end
@@ -330,6 +369,8 @@ local function questieUiMapCandidates(zoneDb, zoneId, instanceId)
 
     if type(zoneDb) == "table" and type(zoneDb.GetUiMapIdByAreaId) == "function" then
         add(safeFirst(zoneDb.GetUiMapIdByAreaId, zoneDb, zoneId))
+    elseif I.SpawnDB then
+        add(I.SpawnDB.areaUiMapId(zoneId))
     end
     addAll(uiMapIdsByInstance(instanceId))
     addAll(uiMapIdsByName(questieAreaName(zoneDb, zoneId)))
@@ -337,8 +378,7 @@ local function questieUiMapCandidates(zoneDb, zoneId, instanceId)
 end
 
 local function questieZoneInstanceId(zoneDb, zoneId)
-    local compat = rawget(_G, "QuestieCompat")
-    local mapData = type(compat) == "table" and compat.UiMapData
+    local mapData = getUiMapData()
     if type(mapData) ~= "table" then
         return nil
     end
@@ -352,24 +392,19 @@ local function questieZoneInstanceId(zoneDb, zoneId)
     return nil
 end
 
--- Convert Questie's 0-100 map coordinates to world yards when its bundled map
--- compatibility layer can do so. Farm-density grades use yards so one grade
--- means roughly the same pull size in every zone. The raw map points remain
--- available for diagnostics and as an ungraded fallback.
+-- Convert 0-100 map coordinates to world yards. Uses Questie's HBD layer when
+-- present, else the bundled reimplementation (worldFromZone), so density grades
+-- work with no dependency. Farm-density grades use yards so one grade means
+-- roughly the same pull size in every zone. The raw map points remain available
+-- for diagnostics and as an ungraded fallback.
 local function questieWorldPoints(points, zoneId, zoneDb, instanceId)
     zoneDb = zoneDb or importQuestieModule("ZoneDB")
-    local compat = rawget(_G, "QuestieCompat")
-    local hbd = type(compat) == "table" and compat.HBD
-    if type(hbd) ~= "table" or type(hbd.GetWorldCoordinatesFromZone) ~= "function" then
-        return nil
-    end
 
     for _, uiMapId in ipairs(questieUiMapCandidates(zoneDb, zoneId, instanceId)) do
         local world, instanceId, valid = {}, nil, true
         for _, point in ipairs(points) do
             local ok, x, y, instance =
-                safeCall(hbd.GetWorldCoordinatesFromZone, hbd,
-                    point[1] / 100, point[2] / 100, uiMapId)
+                worldFromZone(point[1] / 100, point[2] / 100, uiMapId)
             if not ok or not tonumber(x) or not tonumber(y)
                 or (instanceId ~= nil and instance ~= instanceId)
             then

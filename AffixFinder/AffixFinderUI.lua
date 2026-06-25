@@ -356,6 +356,21 @@ local function ExpansionPasses(zoneName)
     return exp == "unknown" or expSet[exp]
 end
 
+-- Signature of the category/expansion selection ZonePasses reads, so
+-- AF.BuildClassRankings can memoize its full mob-edge walk and only rebuild
+-- when the filter actually changes (the Class tab repaints far more often).
+local function ZoneFilterSig()
+    local parts = {}
+    for _, k in ipairs(CATEGORY_ORDER) do
+        parts[#parts + 1] = UI.filters.category[k] and "1" or "0"
+    end
+    parts[#parts + 1] = "|"
+    for _, k in ipairs(EXPANSION_ORDER) do
+        parts[#parts + 1] = UI.filters.expansion[k] and "1" or "0"
+    end
+    return table.concat(parts)
+end
+
 -- Short "; a+b" style note for a multi-select set when it isn't fully selected.
 local function setNote(set, order, labels)
     if allSelected(set, order) then
@@ -1112,13 +1127,7 @@ PANELS[#PANELS + 1] = {
     getRows = function(data, panel)
         local zoneName = AF.GetCurrentZoneName()
         panel._zoneName = zoneName
-        local row = AF.FindZoneRow(data, zoneName)
-        -- When a class is selected, show that class's slice of this zone; the
-        -- per-class tally mirrors the zone row shape, so the rest is identical.
-        local src = row
-        if row and UI.filters.class then
-            src = row.byClass and row.byClass[UI.filters.class]
-        end
+        local src = AF.FindClassZoneRow(data, zoneName, UI.filters.class)
         panel._row = src
         if not src then
             return {}
@@ -1205,7 +1214,7 @@ PANELS[#PANELS + 1] = {
         if UI.filters.scope ~= "account" then
             return {}
         end
-        return AF.BuildClassRankings(data, ZonePasses)
+        return AF.BuildClassRankings(data, ZonePasses, ZoneFilterSig())
     end,
     summary = function(data, n)
         if UI.filters.scope ~= "account" then
@@ -1528,10 +1537,100 @@ local function LayoutColumns(widgets, columns, anchorParent)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Last view + filter persistence (reopen where you left off)
+-- ---------------------------------------------------------------------------
+-- Remember the panel + the scope/forge/bind/category/expansion/class filters the
+-- user last used, so the window reopens on their most-used combo instead of a
+-- fixed default -- and that combo's slice is the one the cache keeps warm, so
+-- reopening hits it instead of a fresh scan. Stored as a few scalars in
+-- AffixFinderDB.ui.view (the same tiny layout table as the window position). The
+-- transient search text (zone/item) is intentionally NOT persisted -- it resets
+-- fresh each open. VIEW_VERSION guards the shape: an older blob is ignored, not
+-- mis-restored.
+local VIEW_VERSION = 1
+
+local function classTokenValid(token)
+    if type(token) ~= "string" then return false end
+    for _, t in ipairs(AF.CLASS_ORDER or {}) do
+        if t == token then return true end
+    end
+    return false
+end
+
+function UI.SaveView()
+    if not UI.frame then return end  -- nothing meaningful before the UI is built
+    local fl = UI.filters
+    local lay = LayoutTable()
+    local view = lay.view
+    if type(view) ~= "table" then
+        view = {}
+        lay.view = view
+    end
+    view.v = VIEW_VERSION
+    view.panel = UI.activePanelIndex
+    view.mode = fl.mode
+    view.scope = fl.scope
+    view.forge = fl.forge
+    view.class = fl.class
+    view.bind = { bop = fl.bind.bop and true or false, boe = fl.bind.boe and true or false }
+    view.category = { dungeon = fl.category.dungeon and true or false,
+                      raid = fl.category.raid and true or false,
+                      world = fl.category.world and true or false }
+    view.expansion = { classic = fl.expansion.classic and true or false,
+                       tbc = fl.expansion.tbc and true or false,
+                       wotlk = fl.expansion.wotlk and true or false }
+end
+
+-- Restore the saved combo into UI.filters + activePanelIndex. Runs at the TOP of
+-- UI.Build, before the filter controls are built, so the multi-selects (which
+-- read UI.filters at build) and the mode/scope/forge sync all reflect it. Every
+-- field is validated -- a stale/corrupt blob must never wedge the UI.
+function UI.RestoreView()
+    local saved = SavedLayout()
+    local v = saved and saved.view
+    if type(v) ~= "table" or v.v ~= VIEW_VERSION then return end
+    local fl = UI.filters
+
+    if v.mode == "affix" or v.mode == "attune" then fl.mode = v.mode end
+    if v.scope == "character" or v.scope == "account" then fl.scope = v.scope end
+    if type(v.forge) == "string" and AF.FORGE_FLAGS and AF.FORGE_FLAGS[v.forge] then
+        fl.forge = v.forge
+    end
+
+    local function restoreSet(dst, src, keys)
+        if type(src) ~= "table" then return end
+        local any = false
+        for _, k in ipairs(keys) do
+            local on = src[k] and true or false
+            dst[k] = on
+            any = any or on
+        end
+        if not any then  -- an all-off multi-select would show nothing; keep all on
+            for _, k in ipairs(keys) do dst[k] = true end
+        end
+    end
+    restoreSet(fl.bind, v.bind, { "bop", "boe" })
+    restoreSet(fl.category, v.category, { "dungeon", "raid", "world" })
+    restoreSet(fl.expansion, v.expansion, { "classic", "tbc", "wotlk" })
+
+    -- class is account-scope-only; ignore (and clear) it otherwise.
+    fl.class = (fl.scope == "account" and classTokenValid(v.class)) and v.class or nil
+
+    if type(v.panel) == "number" and PANELS[v.panel] then
+        UI.activePanelIndex = v.panel
+    end
+end
+
 function UI.Build()
     if UI.frame then
         return UI.frame
     end
+
+    -- Seed UI.filters + activePanelIndex from the saved combo BEFORE building the
+    -- controls, so the multi-selects (which read UI.filters at build time) and the
+    -- mode/scope/forge sync below all open on the restored state.
+    UI.RestoreView()
 
     local f = CreateFrame("Frame", "AffixFinderUIFrame", UIParent)
     f:SetSize(FRAME_W, FRAME_H)
@@ -1957,6 +2056,11 @@ function UI.Build()
     scopeSeg:SetValue(UI.filters.scope, false)
     forgeSeg:SetValue(UI.filters.forge, false)
     UI.UpdateClassControl()
+    -- Reflect a restored class selection in the dropdown text (UpdateClassControl
+    -- only show/hides it; the selection text is otherwise set on click).
+    if UI.filters.class and UI.classDD then
+        UIDropDownMenu_SetText(UI.classDD, AF.ClassDisplayName(UI.filters.class))
+    end
     UI.SelectPanel(UI.activePanelIndex, true)
 
     return f
@@ -2196,9 +2300,8 @@ function UI.RequestData()
 
     -- A panel may declare its own data source (Resist -> ComputeResistData);
     -- otherwise the shared panels read the mode's slice (scope/forge/bind).
-    -- ComputeFarmData builds the active mode's slice AND -- on the first scan,
-    -- when the other mode is still cold -- the other mode's slice in the SAME
-    -- source walk, so flipping Find mode is instant (B).
+    -- ComputeFarmData builds ONLY the active mode's slice (one slice resident at a
+    -- time for memory); flipping Find mode builds the other on demand.
     if panel.fetch then
         panel.fetch(panel, handle)
     else
@@ -2283,6 +2386,10 @@ end
 -- ---------------------------------------------------------------------------
 
 function UI.RefreshActivePanel()
+    -- Persist the current view+filter combo on every interaction (this is the
+    -- chokepoint every filter/panel change re-renders through). Cheap scalar
+    -- write; guarded to no-op before the UI exists.
+    UI.SaveView()
     if not UI.frame or not UI.data then return end
     local panel = ActivePanel()
 
